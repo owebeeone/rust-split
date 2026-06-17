@@ -30,13 +30,30 @@ irm https://github.com/owebeeone/rust-split/releases/download/v0.1.0/rust-split-
 
 Users who already have Rust can still use `cargo install rust-split`.
 
+The installer commands above are the convenience path. They rely on HTTPS and
+the GitHub Release URL for the installer script itself. `curl | sh` and
+`irm | iex` do not verify the installer before executing it.
+
+The release integrity boundary is:
+
+1. Release assets are published with SHA-256 checksums.
+2. Release assets are attested by GitHub artifact attestations.
+3. The generated shell installer downloads the platform archive and verifies the
+   archive checksum before unpacking when its checksum tool is available.
+
+Do not describe the first release as "signed binaries." Describe it as
+"checksummed and attested release assets." For users who want stronger assurance
+than `curl | sh`, document a verified path: download the asset, run
+`gh attestation verify`, compare the checksum, then install.
+
 ## Tool
 
 Use `cargo-dist` for the GitHub release artifacts and generated installers.
 
-The checked-in `installer/install.sh` and `installer/install.ps1` files are uv
-installer samples. They demonstrate the generated script style, but they are not
-release source files for this repo and should not be hand-edited for releases.
+Any checked-in sample installers, such as `scratch/install.sh` and
+`scratch/install.ps1`, are uv installer samples. They demonstrate the generated
+script style, but they are not release source files for this repo and should not
+be hand-edited for releases.
 
 ## Minimal Configuration
 
@@ -135,10 +152,16 @@ Those are useful examples later, not requirements for `rust-split`.
 Generated installers should support:
 
 - choosing the matching archive for the host platform
-- checksum verification when checksums are available
+- archive checksum verification where the generated installer supports it
 - installing into an override directory
 - skipping PATH mutation for CI verification
 - printing a working `rust-split --version` after install
+
+The first release must inspect the generated shell and PowerShell installers
+before documenting any checksum guarantee. The cargo-dist shell installer embeds
+archive checksums; the PowerShell installer should be treated as a convenience
+installer unless the generated script contains an equivalent `Get-FileHash` check
+or a later cargo-dist version adds one.
 
 For the concrete release checklist and installer smoke tests, see
 `dev-docs/RSplitReleaseProcess.md`.

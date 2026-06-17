@@ -21,8 +21,14 @@ For the design context, minimal config, and uv reference boundary, see
    - `aarch64-unknown-linux-gnu`
    - `x86_64-unknown-linux-gnu`
    - `x86_64-pc-windows-msvc`
-7. Confirm `dist generate` ran. `dist init` normally does this automatically.
-8. Commit the generated files:
+7. Run `dist generate --mode ci`.
+8. Edit `.github/workflows/release.yml` so the only trigger is
+   `workflow_dispatch` with a required `tag` input. The workflow must not have
+   `push` or `pull_request` triggers.
+9. Add `allow-dirty = ["ci"]` to `dist-workspace.toml` after the manual workflow
+   edit. This tells cargo-dist that the generated CI file is intentionally
+   patched.
+10. Commit the generated files:
    - `Cargo.toml`
    - `dist-workspace.toml`
    - `.github/workflows/release.yml`
@@ -58,10 +64,11 @@ dist plan
 Use the same cargo-dist version locally as `cargo-dist-version` in
 `dist-workspace.toml`.
 
-Expected `dist-workspace.toml` signing settings:
+Expected `dist-workspace.toml` release settings:
 
 ```toml
 [dist]
+allow-dirty = ["ci"]
 github-attestations = true
 github-attestations-phase = "announce"
 github-attestations-filters = [
@@ -75,15 +82,19 @@ github-attestations-filters = [
 ]
 ```
 
-If config changes later, regenerate and re-check:
+If config changes later, regenerate and re-check. Because the workflow is
+intentionally patched, temporarily remove `allow-dirty = ["ci"]`, regenerate,
+apply the manual-only trigger patch again, then restore `allow-dirty = ["ci"]`:
 
 ```sh
-dist generate
+dist generate --mode ci
 dist plan
 ```
 
-Pull requests should run `dist plan` only by default. Tag pushes run the full
-release build and upload.
+After regenerating, reapply the manual-only trigger check to
+`.github/workflows/release.yml`. Normal commits, pull requests, and tag pushes
+must not start release builds. Releases are started from GitHub Actions with
+`workflow_dispatch`.
 
 ## Release Checklist
 
@@ -100,7 +111,7 @@ dist plan
 ```
 
 5. Commit the release prep.
-6. Tag the release:
+6. Create and push the release tag:
 
 ```sh
 version="0.1.0"
@@ -108,9 +119,12 @@ git tag "v${version}"
 git push origin "v${version}"
 ```
 
-7. Let the generated GitHub Actions release workflow build and upload artifacts.
-8. On the first release, confirm the generated installer uses the expected
-   `RUST_SPLIT_` environment variable names before trusting the smoke tests:
+7. In GitHub Actions, open the `Release` workflow and run it manually. Use the
+   pushed tag as the `tag` input, for example `v0.1.0`.
+8. Let the generated GitHub Actions release workflow build and upload artifacts.
+9. On the first release, confirm the generated installer uses the expected
+   `RUST_SPLIT_` environment variable names before trusting the smoke tests.
+   Also confirm the shell installer contains embedded checksum verification:
 
 ```sh
 version="0.1.0"
@@ -121,9 +135,31 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 grep -q 'RUST_SPLIT_UNMANAGED_INSTALL' "${tmp}/rust-split-installer.sh"
 grep -q 'RUST_SPLIT_NO_MODIFY_PATH' "${tmp}/rust-split-installer.sh"
 grep -q 'RUST_SPLIT_DOWNLOAD_URL' "${tmp}/rust-split-installer.sh"
+grep -q 'verify_checksum' "${tmp}/rust-split-installer.sh"
+grep -q '_checksum_value=' "${tmp}/rust-split-installer.sh"
 ```
 
-9. Verify at least one release asset has a GitHub artifact attestation:
+10. On the first release, inspect the generated PowerShell installer before
+   claiming that it verifies archive checksums:
+
+```powershell
+$version = "0.1.0"
+$tmp = New-Item -ItemType Directory -Force -Path (Join-Path $env:TEMP "rust-split-installer-check")
+$installer = Join-Path $tmp "rust-split-installer.ps1"
+Invoke-WebRequest `
+    "https://github.com/owebeeone/rust-split/releases/download/v$version/rust-split-installer.ps1" `
+    -OutFile $installer
+
+$script = Get-Content $installer -Raw
+if (-not ($script.Contains("RUST_SPLIT_UNMANAGED_INSTALL"))) {
+    throw "PowerShell installer does not use expected RUST_SPLIT_UNMANAGED_INSTALL variable"
+}
+if (-not ($script.Contains("Get-FileHash") -or $script.Contains("checksum"))) {
+    Write-Warning "PowerShell installer does not appear to verify archive checksums; document it as a convenience installer only."
+}
+```
+
+11. Verify at least one release asset has a GitHub artifact attestation:
 
 ```sh
 version="0.1.0"
@@ -137,7 +173,7 @@ gh attestation verify \
   --repo owebeeone/rust-split
 ```
 
-10. After the assets are published, run the installer smoke tests below. The first
+12. After the assets are published, run the installer smoke tests below. The first
    release has to complete CI before these tests can pass, because the scripts
    install from the public GitHub Release URLs.
 
@@ -166,10 +202,25 @@ the uv reference sample uses `.tar.gz` because uv overrides the default.
 The release is not done until both install scripts are smoke-tested against the
 published assets.
 
-Do not run the checked-in `installer/install.sh` or `installer/install.ps1` files
-for this verification. They are uv reference samples. The real installers are
-the generated `rust-split-installer.sh` and `rust-split-installer.ps1` release
-assets.
+The installer commands are convenience paths. `curl | sh` and `irm | iex` execute
+the downloaded installer script before the user can verify that script. The
+installer script can still verify the archive it downloads, but the script itself
+is trusted through HTTPS and the GitHub Release URL unless the user downloads and
+verifies it first.
+
+The verified path is:
+
+1. download the installer or archive
+2. verify the downloaded file with `gh attestation verify`
+3. compare the SHA-256 checksum for archives
+4. run the installer or unpack the archive
+
+The release notes should describe this as "checksummed and attested release
+assets," not "signed binaries."
+
+Do not run any uv reference installer samples for this verification. The real
+installers are the generated `rust-split-installer.sh` and
+`rust-split-installer.ps1` release assets.
 
 Set the version once before running the smoke test.
 
@@ -201,6 +252,61 @@ generated installer as described in the release checklist.
 The version checks assume clap's default `--version` output:
 `rust-split <version>`.
 
+### Verified Unix Install
+
+For users who do not want to pipe directly into `sh`, download and verify the
+installer before running it:
+
+```sh
+set -eu
+
+version="0.1.0"
+tmp="$(mktemp -d)"
+installer="${tmp}/rust-split-installer.sh"
+
+gh release download "v${version}" \
+  --repo owebeeone/rust-split \
+  --pattern 'rust-split-installer.sh' \
+  --dir "${tmp}"
+gh attestation verify "${installer}" --repo owebeeone/rust-split
+sh "${installer}"
+```
+
+The generated cargo-dist shell installer embeds SHA-256 values for platform
+archives and verifies the selected archive before unpacking when the required
+checksum command is available.
+
+### Verified Windows Archive Install
+
+Until the generated PowerShell installer has an explicit checksum check, use the
+archive as the verified Windows install path:
+
+```powershell
+$version = "0.1.0"
+$repo = "owebeeone/rust-split"
+$tmp = New-Item -ItemType Directory -Force -Path (Join-Path $env:TEMP "rust-split-verified")
+$zip = Join-Path $tmp "rust-split-x86_64-pc-windows-msvc.zip"
+$checksum = Join-Path $tmp "rust-split-x86_64-pc-windows-msvc.zip.sha256"
+$installDir = Join-Path $env:USERPROFILE ".local\bin"
+
+gh release download "v$version" `
+    --repo $repo `
+    --pattern "rust-split-x86_64-pc-windows-msvc.zip" `
+    --pattern "rust-split-x86_64-pc-windows-msvc.zip.sha256" `
+    --dir $tmp
+gh attestation verify $zip --repo $repo
+
+$expected = (Get-Content $checksum).Split()[0].ToLowerInvariant()
+$actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actual -ne $expected) {
+    throw "checksum mismatch: expected $expected got $actual"
+}
+
+New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+Expand-Archive -Force -Path $zip -DestinationPath $tmp
+Copy-Item -Force (Join-Path $tmp "rust-split.exe") $installDir
+```
+
 ### Unix Installer
 
 Run this on macOS and Linux after the release assets exist:
@@ -231,8 +337,9 @@ printf 'fn main() {}\n' > "${sample}"
 test -f "${out}/manifest.toml"
 ```
 
-The installer chooses the platform archive and verifies checksums when the
-generated release metadata provides them.
+The installer chooses the platform archive. The cargo-dist shell installer embeds
+archive checksums and verifies them before unpacking when the required checksum
+command is available.
 
 ### Windows Installer
 
