@@ -22,12 +22,12 @@ For the design context, minimal config, and uv reference boundary, see
    - `x86_64-unknown-linux-gnu`
    - `x86_64-pc-windows-msvc`
 7. Run `dist generate --mode ci`.
-8. Edit `.github/workflows/release.yml` so the only trigger is
-   `workflow_dispatch` with a required `tag` input. The workflow must not have
-   `push` or `pull_request` triggers.
-9. Add `allow-dirty = ["ci"]` to `dist-workspace.toml` after the manual workflow
-   edit. This tells cargo-dist that the generated CI file is intentionally
-   patched.
+8. Edit `.github/workflows/release.yml` so release builds trigger on
+   `release.published`. Keep `workflow_dispatch` only as a repair/retry path for
+   an already-published release. The workflow must not have `push` or
+   `pull_request` triggers.
+9. Add `allow-dirty = ["ci"]` to `dist-workspace.toml` after the workflow edit.
+   This tells cargo-dist that the generated CI file is intentionally patched.
 10. Commit the generated files:
    - `Cargo.toml`
    - `dist-workspace.toml`
@@ -84,17 +84,17 @@ github-attestations-filters = [
 
 If config changes later, regenerate and re-check. Because the workflow is
 intentionally patched, temporarily remove `allow-dirty = ["ci"]`, regenerate,
-apply the manual-only trigger patch again, then restore `allow-dirty = ["ci"]`:
+apply the release-event trigger patch again, then restore `allow-dirty = ["ci"]`:
 
 ```sh
 dist generate --mode ci
 dist plan
 ```
 
-After regenerating, reapply the manual-only trigger check to
-`.github/workflows/release.yml`. Normal commits, pull requests, and tag pushes
-must not start release builds. Releases are started from GitHub Actions with
-`workflow_dispatch`.
+After regenerating, reapply the trigger check to `.github/workflows/release.yml`.
+Normal commits, pull requests, and tag pushes must not start release builds.
+Release builds start when a GitHub Release is published. `workflow_dispatch`
+exists only to retry or repair an already-published release.
 
 ## Release Checklist
 
@@ -119,9 +119,9 @@ git tag "v${version}"
 git push origin "v${version}"
 ```
 
-7. In GitHub Actions, open the `Release` workflow and run it manually. Use the
-   pushed tag as the `tag` input, for example `v0.1.0`.
-8. Let the generated GitHub Actions release workflow build and upload artifacts.
+7. Create a GitHub Release for the pushed tag and publish it.
+8. Let the GitHub Actions release workflow build and upload artifacts to that
+   existing release.
 9. On the first release, confirm the generated installer uses the expected
    `RUST_SPLIT_` environment variable names before trusting the smoke tests.
    Also confirm the shell installer contains embedded checksum verification:

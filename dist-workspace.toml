@@ -23,7 +23,7 @@ install-path = "CARGO_HOME"
 hosting = "github"
 # Whether to install an updater program
 install-updater = false
-# The generated workflow is intentionally hand-constrained to workflow_dispatch.
+# The generated workflow is intentionally hand-constrained to explicit release events.
 allow-dirty = ["ci"]
 # Generate GitHub Artifact Attestations for release assets
 github-attestations = true
