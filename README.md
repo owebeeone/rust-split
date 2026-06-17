@@ -42,16 +42,92 @@ the generated chunk files in order must reproduce the original file exactly. The
 second (`split`) rewrites the module graph, so it intentionally adds module
 declarations, re-exports, imports, and some `pub(crate)` visibility.
 
+## Install
+
+Install the latest release on macOS or Linux:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/owebeeone/rust-split/releases/latest/download/rust-split-installer.sh | sh
+```
+
+Install the latest release on Windows PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/owebeeone/rust-split/releases/latest/download/rust-split-installer.ps1 | iex"
+```
+
+The `latest` URLs point at the newest non-prerelease GitHub Release. If you want
+a pinned install, replace `latest` with a concrete tag such as `v0.1.1`:
+
+```text
+https://github.com/owebeeone/rust-split/releases/download/v0.1.1/rust-split-installer.sh
+```
+
+Users who already have Rust can install from source:
+
+```sh
+cargo install --git https://github.com/owebeeone/rust-split
+```
+
+### Smoke Test Installers
+
+Test the Unix installer without modifying `PATH`:
+
+```sh
+tmp="$(mktemp -d)"
+
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/owebeeone/rust-split/releases/latest/download/rust-split-installer.sh \
+  -o "${tmp}/rust-split-installer.sh"
+
+RUST_SPLIT_UNMANAGED_INSTALL="${tmp}/bin" \
+RUST_SPLIT_NO_MODIFY_PATH=1 \
+sh "${tmp}/rust-split-installer.sh"
+
+"${tmp}/bin/rust-split" --version
+"${tmp}/bin/rust-split" --help
+```
+
+Test the Windows installer without modifying `PATH`:
+
+```powershell
+$ErrorActionPreference = "Stop"
+
+$tmp = Join-Path $env:TEMP "rust-split-test-$([guid]::NewGuid())"
+New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+
+$installer = Join-Path $tmp "rust-split-installer.ps1"
+Invoke-WebRequest `
+  "https://github.com/owebeeone/rust-split/releases/latest/download/rust-split-installer.ps1" `
+  -OutFile $installer
+
+$env:RUST_SPLIT_UNMANAGED_INSTALL = Join-Path $tmp "bin"
+$env:RUST_SPLIT_NO_MODIFY_PATH = "1"
+
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+& $installer
+
+$exe = Join-Path $env:RUST_SPLIT_UNMANAGED_INSTALL "rust-split.exe"
+& $exe --version
+& $exe --help
+```
+
+Release assets are checksummed and have GitHub artifact attestations. The
+installers are convenience scripts; users who want stronger verification should
+download the release asset, verify the attestation, compare the SHA-256 checksum,
+and then install.
+
 ## Commands
 
-Build a local binary:
+Build a local development binary:
 
 ```sh
 cargo build
 ./target/debug/rust-split --help
 ```
 
-Or install it onto your Cargo bin path:
+Or install the current checkout onto your Cargo bin path:
 
 ```sh
 cargo install --path .
