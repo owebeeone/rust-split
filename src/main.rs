@@ -4,7 +4,11 @@ use std::path::PathBuf;
 
 /// A parser-based god-file splitter for Rust source.
 #[derive(Debug, Parser)]
-#[command(name = "rust-split", version)]
+#[command(
+    name = "rust-split",
+    version,
+    after_help = "More info: https://github.com/owebeeone/rust-split"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

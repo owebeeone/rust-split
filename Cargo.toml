@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.95"
 description = "A parser-based god-file splitter for Rust source."
 license = "GPL-2.0-only"
+repository = "https://github.com/owebeeone/rust-split"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
