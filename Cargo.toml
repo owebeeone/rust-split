@@ -1,0 +1,18 @@
+[package]
+name = "rust-split"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "A parser-based god-file splitter for Rust source."
+license = "GPL-2.0-only"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+serde = { version = "1", features = ["derive"] }
+syn = { version = "2", features = ["full", "parsing", "visit"] }
+toml = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
