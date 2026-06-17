@@ -101,7 +101,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             });
             fs::create_dir_all(&dir)?;
             for file in &output.files {
-                fs::write(dir.join(&file.path), &file.contents)?;
+                let path = dir.join(&file.path);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(path, &file.contents)?;
             }
             for file in &output.files {
                 println!("{:>5}  {}", file.loc, file.path);

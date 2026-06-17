@@ -38,7 +38,7 @@ pub fn split_bin(exploded: &Exploded, max_loc: usize, root_stem: &str) -> SplitO
         .sum();
     let item_budget = max_loc.saturating_sub(header_loc + PART_OVERHEAD).max(1);
     let plan = plan_split(exploded, item_budget);
-    reassemble_bin(exploded, &plan, root_stem)
+    reassemble_bin(exploded, &plan, root_stem, max_loc)
 }
 
 /// A file the split would write.
@@ -99,21 +99,28 @@ pub fn split_mod(exploded: &Exploded, max_loc: usize, root_stem: &str) -> SplitO
         .sum();
     let item_budget = max_loc.saturating_sub(header_loc + PART_OVERHEAD).max(1);
     let plan = plan_split(exploded, item_budget);
-    reassemble(exploded, &plan, root_stem, Topology::Mod)
+    reassemble(exploded, &plan, root_stem, Topology::Mod, max_loc)
 }
 
 /// Reassemble a binary crate-root split (back-compat wrapper).
-pub fn reassemble_bin(exploded: &Exploded, plan: &SplitPlan, root_stem: &str) -> SplitOutput {
-    reassemble(exploded, plan, root_stem, Topology::Bin)
+pub fn reassemble_bin(
+    exploded: &Exploded,
+    plan: &SplitPlan,
+    root_stem: &str,
+    max_loc: usize,
+) -> SplitOutput {
+    reassemble(exploded, plan, root_stem, Topology::Bin, max_loc)
 }
 
 /// Reassemble a split for the given module topology. `root_stem` is the source
-/// file's stem (`"main"` for `main.rs`, `"mod"` for `foo/mod.rs`).
+/// file's stem (`"main"` for `main.rs`, `"mod"` for `foo/mod.rs`). `max_loc` is
+/// the ceiling, needed to recursively split an oversized test module.
 fn reassemble(
     exploded: &Exploded,
     plan: &SplitPlan,
     root_stem: &str,
     topology: Topology,
+    max_loc: usize,
 ) -> SplitOutput {
     let sibling = match topology {
         Topology::Bin => "crate",
@@ -193,21 +200,24 @@ fn reassemble(
         });
     }
 
-    // Oversized items: a `mod` is extracted whole to its own file (still over
-    // budget until a later nested split); a leaf can't be moved out cleanly.
+    // Oversized items: a `mod` under the ceiling is extracted whole; a `mod`
+    // over it is recursively split into a `{name}/` subdir; a leaf can't move.
     for over in &plan.oversized {
         if over.recoverable && over.kind == "mod" {
             let chunk = chunk_text(over.chunk_index);
             let (attrs, inner) = extract_mod(chunk, &over.name);
-            let l = loc(&inner);
-            files.push(OutputFile {
-                path: format!("{}.rs", over.name),
-                contents: inner,
-                loc: l,
-            });
+            let inner_loc = loc(&inner);
             mod_decls.push_str(&format!("{attrs}mod {};\n", over.name));
-            if l >= 500 {
-                still_oversized.push(format!("{} ({} LOC, needs nested split)", over.name, l));
+            if inner_loc < max_loc {
+                files.push(OutputFile {
+                    path: format!("{}.rs", over.name),
+                    contents: inner,
+                    loc: inner_loc,
+                });
+            } else {
+                let (nested, nested_still) = split_nested_mod(&over.name, &inner, max_loc);
+                files.extend(nested);
+                still_oversized.extend(nested_still);
             }
         } else {
             still_oversized.push(format!(
@@ -413,6 +423,76 @@ fn extract_mod(chunk_text: &str, name: &str) -> (String, String) {
     (attrs, inner_lines.concat())
 }
 
+/// Recursively split an over-budget module's inner body into a `{name}/`
+/// subdirectory: `{name}/mod.rs` forwards the enclosing module's items
+/// (`pub(crate) use super::*`) and re-exports the clusters; each `{name}/gNN.rs`
+/// holds a cohesive cluster and reaches everything via `super::*`. Used for big
+/// test modules.
+fn split_nested_mod(name: &str, inner: &str, max_loc: usize) -> (Vec<OutputFile>, Vec<String>) {
+    let Ok(exploded) = crate::explode(inner) else {
+        return (
+            vec![OutputFile {
+                path: format!("{name}.rs"),
+                contents: inner.to_owned(),
+                loc: loc(inner),
+            }],
+            vec![format!("{name} (could not parse for nested split)")],
+        );
+    };
+
+    // Inner header = the module's own imports, minus `use super::*` (the parent
+    // glob — `{name}/mod.rs` forwards that instead).
+    let is_super_glob = |t: &str| t.replace(' ', "").contains("usesuper::*;");
+    let group_header: String = exploded
+        .manifest
+        .rows
+        .iter()
+        .filter(|r| matches!(r.kind.as_str(), "use" | "preamble" | "extern_crate"))
+        .map(|r| exploded.chunks[r.chunk_index].text.as_str())
+        .filter(|t| !is_super_glob(t))
+        .collect();
+    let header_loc = loc(&group_header);
+    let item_budget = max_loc.saturating_sub(header_loc + PART_OVERHEAD).max(1);
+    let plan = plan_split(&exploded, item_budget);
+
+    let mut files = Vec::new();
+    let mut decls = String::new();
+    let mut reexports = String::new();
+    let mut still = Vec::new();
+    for (idx, part) in plan.parts.iter().enumerate() {
+        let module = format!("g{idx:02}");
+        let mut body = String::new();
+        for &ci in &part.chunk_indices {
+            body.push_str(&bump_visibility(exploded.chunks[ci].text.as_str()));
+        }
+        let contents = format!("{group_header}\nuse super::*;\n\n{body}");
+        files.push(OutputFile {
+            path: format!("{name}/{module}.rs"),
+            loc: loc(&contents),
+            contents,
+        });
+        decls.push_str(&format!("mod {module};\n"));
+        reexports.push_str(&format!("pub(crate) use {module}::*;\n"));
+    }
+    for over in &plan.oversized {
+        still.push(format!(
+            "{name}::{} ({} LOC {}, leaf needs manual extraction)",
+            over.name, over.loc, over.kind
+        ));
+    }
+
+    let modrs = format!("pub(crate) use super::*;\n\n{decls}\n{reexports}");
+    files.insert(
+        0,
+        OutputFile {
+            path: format!("{name}/mod.rs"),
+            loc: loc(&modrs),
+            contents: modrs,
+        },
+    );
+    (files, still)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,10 +550,42 @@ mod tests {
         let src = format!("fn main() {{}}\n\n#[cfg(test)]\nmod tests {{\n{inner}}}\n");
         let exploded = explode(&src).unwrap();
         let plan = plan_split(&exploded, 6);
-        let out = reassemble_bin(&exploded, &plan, "main");
+        // ceiling large enough that the test mod fits whole -> single tests.rs
+        let out = reassemble_bin(&exploded, &plan, "main", 1000);
         let tests = out.files.iter().find(|f| f.path == "tests.rs").unwrap();
         assert!(tests.contents.contains("fn t0()"));
         assert!(!tests.contents.contains("mod tests"));
+        let root = out.files.iter().find(|f| f.path == "main.rs").unwrap();
+        assert!(root.contents.contains("#[cfg(test)]\nmod tests;"));
+    }
+
+    #[test]
+    fn an_over_ceiling_test_mod_is_nested_into_a_subdir() {
+        // 30 test fns referencing a shared helper -> test mod far over a tiny ceiling
+        let mut inner =
+            String::from("    use super::*;\n\n    fn helper() -> i32 {\n        1\n    }\n");
+        for i in 0..30 {
+            inner.push_str(&format!(
+                "\n    #[test]\n    fn t{i}() {{\n        assert_eq!(helper(), 1);\n    }}\n"
+            ));
+        }
+        let src = format!(
+            "pub fn helper() -> i32 {{\n    1\n}}\n\nfn main() {{}}\n\n#[cfg(test)]\nmod tests {{\n{inner}}}\n"
+        );
+        let exploded = explode(&src).unwrap();
+        let out = split_bin(&exploded, 60, "main");
+
+        // the test mod became a `tests/` subdir, every file under the ceiling
+        let mod_rs = out.files.iter().find(|f| f.path == "tests/mod.rs").unwrap();
+        assert!(
+            mod_rs.contents.contains("pub(crate) use super::*;"),
+            "forwards the parent"
+        );
+        assert!(mod_rs.contents.contains("mod g00;"));
+        assert!(out.files.iter().any(|f| f.path == "tests/g00.rs"));
+        for f in &out.files {
+            assert!(f.loc < 60, "{} over ceiling: {}", f.path, f.loc);
+        }
         let root = out.files.iter().find(|f| f.path == "main.rs").unwrap();
         assert!(root.contents.contains("#[cfg(test)]\nmod tests;"));
     }
