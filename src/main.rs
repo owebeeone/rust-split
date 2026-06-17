@@ -21,6 +21,20 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+
+    /// Split a binary crate-root file into modules each under the budget.
+    Split {
+        /// Rust source file to split (e.g. src/main.rs).
+        file: PathBuf,
+
+        /// Maximum LOC per output file.
+        #[arg(long, default_value_t = 500)]
+        max_loc: usize,
+
+        /// Output directory (defaults to the source file's directory, in place).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -56,6 +70,41 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 out.join("manifest.toml"),
                 rust_split::manifest_toml(&exploded.manifest)?,
             )?;
+            Ok(())
+        }
+
+        Command::Split { file, max_loc, out } => {
+            let src = fs::read_to_string(&file)?;
+            let exploded = rust_split::explode(&src)?;
+            let stem = file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or("source file has no stem")?;
+            let output = rust_split::split_bin(&exploded, max_loc, stem);
+            let dir = out.unwrap_or_else(|| {
+                file.parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("."))
+            });
+            fs::create_dir_all(&dir)?;
+            for file in &output.files {
+                fs::write(dir.join(&file.path), &file.contents)?;
+            }
+            for file in &output.files {
+                println!("{:>5}  {}", file.loc, file.path);
+            }
+            if !output.still_oversized.is_empty() {
+                eprintln!("still oversized (need nested split / manual extraction):");
+                for item in &output.still_oversized {
+                    eprintln!("  {item}");
+                }
+            }
+            println!(
+                "{} files, max {} LOC (budget {})",
+                output.files.len(),
+                output.max_loc(),
+                max_loc
+            );
             Ok(())
         }
     }

@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
+pub mod plan;
+pub mod reassemble;
+pub use plan::{Oversized, Part, SplitPlan, plan_split};
+pub use reassemble::{OutputFile, SplitOutput, reassemble_bin, split_bin};
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
@@ -419,6 +424,19 @@ fn item_adjacency_candidates(item: &syn::Item) -> BTreeSet<String> {
     visitor.names
 }
 
+/// Recursively collect every identifier in a macro's token stream.
+fn collect_macro_idents(tokens: &proc_macro2::TokenStream, names: &mut BTreeSet<String>) {
+    for tree in tokens.clone() {
+        match tree {
+            proc_macro2::TokenTree::Ident(ident) => {
+                names.insert(ident.to_string());
+            }
+            proc_macro2::TokenTree::Group(group) => collect_macro_idents(&group.stream(), names),
+            _ => {}
+        }
+    }
+}
+
 #[derive(Default)]
 struct AdjacencyVisitor {
     names: BTreeSet<String>,
@@ -494,6 +512,15 @@ impl<'ast> Visit<'ast> for AdjacencyVisitor {
 
     fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
         self.visit_macro(&item.mac);
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        // syn does not parse macro bodies, so references inside `json!{ ... }`,
+        // `vec![ foo() ]`, etc. are invisible to the typed visitor. Harvest
+        // every identifier from the raw token stream; the sibling-name filter
+        // discards the noise, keeping only real cross-references.
+        collect_macro_idents(&mac.tokens, &mut self.names);
+        visit::visit_macro(self, mac);
     }
 
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
