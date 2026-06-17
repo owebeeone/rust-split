@@ -34,6 +34,10 @@ enum Command {
         /// Output directory (defaults to the source file's directory, in place).
         #[arg(long)]
         out: Option<PathBuf>,
+
+        /// Treat the file as a nested library module (`foo/mod.rs`), not a bin root.
+        #[arg(long)]
+        module: bool,
     },
 }
 
@@ -73,14 +77,23 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
 
-        Command::Split { file, max_loc, out } => {
+        Command::Split {
+            file,
+            max_loc,
+            out,
+            module,
+        } => {
             let src = fs::read_to_string(&file)?;
             let exploded = rust_split::explode(&src)?;
             let stem = file
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .ok_or("source file has no stem")?;
-            let output = rust_split::split_bin(&exploded, max_loc, stem);
+            let output = if module {
+                rust_split::split_mod(&exploded, max_loc, stem)
+            } else {
+                rust_split::split_bin(&exploded, max_loc, stem)
+            };
             let dir = out.unwrap_or_else(|| {
                 file.parent()
                     .map(|p| p.to_path_buf())

@@ -10,7 +10,7 @@ use syn::visit::{self, Visit};
 pub mod plan;
 pub mod reassemble;
 pub use plan::{Oversized, Part, SplitPlan, plan_split};
-pub use reassemble::{OutputFile, SplitOutput, reassemble_bin, split_bin};
+pub use reassemble::{OutputFile, SplitOutput, Topology, reassemble_bin, split_bin, split_mod};
 
 pub type Result<T> = std::result::Result<T, Error>;
 

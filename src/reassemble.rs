@@ -74,10 +74,51 @@ fn loc(text: &str) -> usize {
     }
 }
 
-/// Reassemble a binary crate-root split. `root_stem` is the source file's stem
-/// without extension (`"main"` for `main.rs`); the rewritten root is written
-/// back to `{root_stem}.rs`.
+/// How the split file sits in the module tree — fixes the sibling path prefix
+/// and the re-export visibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Topology {
+    /// A binary crate root (`main.rs`): siblings reached via `crate::`,
+    /// re-exported `pub(crate)`, `fn main` kept at the root.
+    Bin,
+    /// A nested library module (`foo/mod.rs`): sub-modules reached via `super::`,
+    /// re-exported `pub` (to preserve the module's external API) *and*
+    /// `pub(crate)` (for internal cross-references).
+    Mod,
+}
+
+/// Plan and reassemble a nested library module (`foo/mod.rs`) so every output
+/// file is `< max_loc`; sub-modules see each other via `super::*`.
+pub fn split_mod(exploded: &Exploded, max_loc: usize, root_stem: &str) -> SplitOutput {
+    let header_loc: usize = exploded
+        .manifest
+        .rows
+        .iter()
+        .filter(|r| matches!(r.kind.as_str(), "use" | "preamble" | "extern_crate"))
+        .map(|r| r.loc)
+        .sum();
+    let item_budget = max_loc.saturating_sub(header_loc + PART_OVERHEAD).max(1);
+    let plan = plan_split(exploded, item_budget);
+    reassemble(exploded, &plan, root_stem, Topology::Mod)
+}
+
+/// Reassemble a binary crate-root split (back-compat wrapper).
 pub fn reassemble_bin(exploded: &Exploded, plan: &SplitPlan, root_stem: &str) -> SplitOutput {
+    reassemble(exploded, plan, root_stem, Topology::Bin)
+}
+
+/// Reassemble a split for the given module topology. `root_stem` is the source
+/// file's stem (`"main"` for `main.rs`, `"mod"` for `foo/mod.rs`).
+fn reassemble(
+    exploded: &Exploded,
+    plan: &SplitPlan,
+    root_stem: &str,
+    topology: Topology,
+) -> SplitOutput {
+    let sibling = match topology {
+        Topology::Bin => "crate",
+        Topology::Mod => "super",
+    };
     let chunk_text = |i: usize| exploded.chunks[i].text.as_str();
     let row = |i: usize| {
         exploded
@@ -133,9 +174,17 @@ pub fn reassemble_bin(exploded: &Exploded, plan: &SplitPlan, root_stem: &str) ->
                 loc: 0,
             });
         }
-        let contents = format!("{header}\nuse crate::*;\n\n{body}");
+        let contents = format!("{header}\nuse {sibling}::*;\n\n{body}");
         mod_decls.push_str(&format!("mod {module};\n"));
-        reexports.push_str(&format!("pub(crate) use {module}::*;\n"));
+        match topology {
+            Topology::Bin => reexports.push_str(&format!("pub(crate) use {module}::*;\n")),
+            Topology::Mod => {
+                // `pub` preserves the module's external API; `pub(crate)` lets
+                // sibling sub-modules see internal (pub(crate)-bumped) items.
+                reexports.push_str(&format!("pub use {module}::*;\n"));
+                reexports.push_str(&format!("pub(crate) use {module}::*;\n"));
+            }
+        }
         let l = loc(&contents);
         files.push(OutputFile {
             path: format!("{module}.rs"),
@@ -427,5 +476,35 @@ mod tests {
         assert!(!tests.contents.contains("mod tests"));
         let root = out.files.iter().find(|f| f.path == "main.rs").unwrap();
         assert!(root.contents.contains("#[cfg(test)]\nmod tests;"));
+    }
+
+    #[test]
+    fn split_mod_uses_super_and_preserves_pub_api() {
+        // alpha (pub, the module's API) calls beta (private helper) -> one cluster
+        let src = "use std::fmt;\n\npub fn alpha() -> i32 {\n    beta()\n}\n\nfn beta() -> i32 {\n    1\n}\n";
+        let exploded = explode(src).unwrap();
+        let out = split_mod(&exploded, 10_000, "mod");
+
+        let root = out.files.iter().find(|f| f.path == "mod.rs").unwrap();
+        assert!(
+            root.contents.contains("pub use "),
+            "pub re-export preserves the API"
+        );
+        assert!(
+            root.contents.contains("pub(crate) use "),
+            "pub(crate) for internal refs"
+        );
+
+        let sub = out.files.iter().find(|f| f.path != "mod.rs").unwrap();
+        assert!(
+            sub.contents.contains("use super::*;"),
+            "siblings reached via super, not crate"
+        );
+        assert!(!sub.contents.contains("use crate::*;"));
+        assert!(sub.contents.contains("pub fn alpha"), "pub item stays pub");
+        assert!(
+            sub.contents.contains("pub(crate) fn beta"),
+            "private bumped to pub(crate)"
+        );
     }
 }
