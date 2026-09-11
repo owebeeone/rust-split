@@ -4,14 +4,22 @@
 //! live in one module and reference each other by bare name. Splitting them
 //! into sibling modules breaks those bare references, so the scheme is:
 //!
-//! - the crate root keeps the file preamble + imports, declares each part
-//!   module, **`pub(crate) use part::*`** re-exports every part, and keeps
-//!   `fn main` (the entry point must stay at the root);
-//! - each part file over-includes the same import header, does `use crate::*`
-//!   to see its siblings via the root re-exports, and carries its items with
-//!   `pub(crate)` visibility bumped on so the re-exports can see them;
-//! - an oversized `mod` (e.g. the test module) is extracted whole to its own
-//!   file and declared at the root, keeping its `super::*` pointing at the root.
+//! - the crate root keeps the file preamble + imports, the source's own
+//!   re-exports (`pub use ...` — dropping or demoting one would narrow the
+//!   crate's public API) and content-less `mod name;` declarations verbatim,
+//!   declares each part module, re-exports each part with a single glob whose
+//!   visibility matches the part's widest item (`pub use` when the part has a
+//!   public item, else `pub(crate) use`, and nothing for an `impl`-only part),
+//!   and keeps `fn main` (the entry point must stay at the root);
+//! - each part file copies the imports it references by name (preamble stays at
+//!   the root), does `use crate::*` to see its siblings via the root re-exports,
+//!   and carries its items with `pub(crate)` visibility bumped on so the
+//!   re-exports can see them;
+//! - a body-carrying `mod` (e.g. the test module) of **any size** is extracted
+//!   whole to its own file — its attributes (`#[cfg(test)]` must keep gating
+//!   it) and visibility travel to the root declaration, and its `super::*`
+//!   keeps pointing at the root; one over the ceiling is split further into a
+//!   `{name}/` subdirectory.
 //!
 //! Residual import/visibility that this mechanical scheme misses is left for the
 //! compiler to enumerate (the documented O(n) finish) — but the LOC budget and
@@ -20,13 +28,14 @@
 use crate::{Exploded, SplitPlan, plan_split};
 use syn::spanned::Spanned;
 
-/// Over-include overhead added to each part beyond the shared header:
-/// `use crate::*;` plus blank-line separators.
+/// Per-part overhead beyond the imports: the `use crate::*;` sibling glob plus
+/// blank-line separators.
 const PART_OVERHEAD: usize = 3;
 
 /// Plan and reassemble a binary crate-root split so that **every output file is
-/// `< max_loc`**. The item budget is reduced by the header (over-included into
-/// each part) and the per-part overhead, so a packed part plus its header stays
+/// `< max_loc`**. The item budget reserves the full header LOC and the per-part
+/// overhead; since a part now copies only the imports it references (a subset of
+/// the header), this reservation is conservative — a packed part stays safely
 /// under budget.
 pub fn split_bin(exploded: &Exploded, max_loc: usize, root_stem: &str) -> SplitOutput {
     let header_loc: usize = exploded
@@ -75,20 +84,26 @@ fn loc(text: &str) -> usize {
 }
 
 /// How the split file sits in the module tree — fixes the sibling path prefix
-/// and the re-export visibility.
+/// and where sub-module files go. Re-export visibility is per part in both
+/// topologies: `pub use` when the part has a public item (preserving the
+/// crate's public API), else `pub(crate) use`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Topology {
-    /// A binary crate root (`main.rs`): siblings reached via `crate::`,
-    /// re-exported `pub(crate)`, `fn main` kept at the root.
+    /// A binary or library crate root (`main.rs`, `lib.rs`): siblings reached
+    /// via `crate::`, `fn main` (if any) kept at the root.
     Bin,
-    /// A nested library module (`foo/mod.rs`): sub-modules reached via `super::`,
-    /// re-exported `pub` (to preserve the module's external API) *and*
-    /// `pub(crate)` (for internal cross-references).
+    /// A nested library module (`foo/mod.rs`, or a plain `foo.rs` file module):
+    /// sub-modules reached via `super::` and re-exported with a single per-module
+    /// glob — `pub use` to preserve a public API, else `pub(crate) use`. A plain
+    /// `foo.rs` file module resolves `mod bar;` to `foo/bar.rs`, so its
+    /// sub-modules are written into a `foo/` subdir.
     Mod,
 }
 
-/// Plan and reassemble a nested library module (`foo/mod.rs`) so every output
-/// file is `< max_loc`; sub-modules see each other via `super::*`.
+/// Plan and reassemble a library module so every output file is `< max_loc`;
+/// sub-modules see each other via `super::*`. Handles both a directory-owning
+/// `foo/mod.rs` (sub-modules become siblings) and a plain `foo.rs` file module
+/// (sub-modules go in a `foo/` subdir). `root_stem` is the source file's stem.
 pub fn split_mod(exploded: &Exploded, max_loc: usize, root_stem: &str) -> SplitOutput {
     let header_loc: usize = exploded
         .manifest
@@ -136,23 +151,73 @@ fn reassemble(
             .unwrap()
     };
 
-    // Shared header (preamble + imports), verbatim.
-    let header: String = plan.header.iter().map(|&i| chunk_text(i)).collect();
+    // Where sub-module files go. A directory-owning module file
+    // (`main.rs`/`lib.rs`/`foo/mod.rs`) keeps them as siblings; a plain `foo.rs`
+    // file module resolves `mod bar;` to `foo/bar.rs`, so its parts go in `foo/`.
+    let sub_prefix = match topology {
+        Topology::Bin => String::new(),
+        Topology::Mod if matches!(root_stem, "mod" | "lib" | "main") => String::new(),
+        Topology::Mod => format!("{root_stem}/"),
+    };
+
+    // The crate/module preamble (inner `//!` docs / `#![...]` attrs) stays at
+    // the root only — a crate-root `#![feature]` is a hard error in a sub-module
+    // file, and a crate-root `#![allow]` already covers descendants. The import
+    // chunks (`use`/`extern crate`) are copied into each file, but only the ones
+    // that file references by name (see `select_imports`). Re-exports
+    // (`pub use ...`) are not imports — the planner routes them to
+    // `plan.root_items`, kept at the root verbatim.
+    let preamble: String = plan
+        .header
+        .iter()
+        .filter(|&&i| row(i).kind == "preamble")
+        .map(|&i| chunk_text(i))
+        .collect();
+    let import_chunks: Vec<usize> = plan
+        .header
+        .iter()
+        .copied()
+        .filter(|&i| row(i).kind != "preamble")
+        .collect();
+
+    // Source chunks that stay at the root verbatim: `pub use` re-exports (the
+    // crate's public surface) and content-less `mod name;` declarations (which
+    // bind files relative to the root's directory).
+    let root_kept: String = plan.root_items.iter().map(|&i| chunk_text(i)).collect();
+
+    // Module names fixed by the source — extracted body-mods and `mod name;`
+    // declarations keep their own names — plus the root's stem; a generated
+    // part that would collide is renamed with a `_` suffix.
+    let mut reserved: std::collections::BTreeSet<&str> =
+        plan.mods.iter().map(|&i| row(i).name.as_str()).collect();
+    reserved.insert(root_stem);
+    for &i in &plan.root_items {
+        if row(i).kind == "mod" {
+            reserved.insert(row(i).name.as_str());
+        }
+    }
 
     let mut files = Vec::new();
     let mut mod_decls = String::new();
     let mut reexports = String::new();
     let mut still_oversized = Vec::new();
+    // Names referenced from the root file itself (`fn main`, extracted module
+    // bodies whose `use super::*` reaches the root's imports).
+    let mut root_refs = Refs::default();
 
     // Part modules, named after their cluster's dominant item.
     for part in &plan.parts {
-        let module = if part.name == root_stem {
+        let module = if reserved.contains(part.name.as_str()) {
             format!("{}_", part.name)
         } else {
             part.name.clone()
         };
         let mut body = String::new();
         let mut root_main = None;
+        // Widest visibility any moved item contributes to a glob re-export.
+        let mut export_vis = ExportVis::None;
+        // Names this part references, so only the imports it uses are copied in.
+        let mut refs = Refs::default();
         for &i in &part.chunk_indices {
             let r = row(i);
             // `fn main` must stay at the crate root, not move into a submodule.
@@ -160,6 +225,8 @@ fn reassemble(
                 root_main = Some(i);
                 continue;
             }
+            export_vis = export_vis.max(item_export_vis(chunk_text(i)));
+            refs.add(chunk_text(i));
             body.push_str(&bump_visibility(chunk_text(i)));
         }
         // If the part was only `fn main`, it produced no module file.
@@ -181,50 +248,69 @@ fn reassemble(
                 loc: 0,
             });
         }
-        let contents = format!("{header}\nuse {sibling}::*;\n\n{body}");
+        let part_imports = select_imports(&import_chunks, &exploded.chunks, &refs);
+        let contents = part_file(&part_imports, sibling, &body);
         mod_decls.push_str(&format!("mod {module};\n"));
-        match topology {
-            Topology::Bin => reexports.push_str(&format!("pub(crate) use {module}::*;\n")),
-            Topology::Mod => {
-                // `pub` preserves the module's external API; `pub(crate)` lets
-                // sibling sub-modules see internal (pub(crate)-bumped) items.
-                reexports.push_str(&format!("pub use {module}::*;\n"));
-                reexports.push_str(&format!("pub(crate) use {module}::*;\n"));
-            }
+        // One glob re-export per module, visibility chosen by the module's widest
+        // item: `pub use` when it has a public item (a `pub use *` caps each item
+        // at its own visibility, so it covers internal `pub(crate)` items in the
+        // same line); else `pub(crate) use`; and nothing when the module exposes
+        // no nameable item (e.g. a bare `impl` — a glob re-export would only warn
+        // "doesn't reexport anything"). This keeps the crate's public surface
+        // (`pub use`) reachable and avoids the redundant double re-export.
+        if let Some(line) = reexport_line(export_vis, &module) {
+            reexports.push_str(&line);
         }
         let l = loc(&contents);
         files.push(OutputFile {
-            path: format!("{module}.rs"),
+            path: format!("{sub_prefix}{module}.rs"),
             contents,
             loc: l,
         });
     }
 
-    // Oversized items: a `mod` under the ceiling is extracted whole; a `mod`
-    // over it is recursively split into a `{name}/` subdir; a leaf can't move.
-    for over in &plan.oversized {
-        if over.recoverable && over.kind == "mod" {
-            let chunk = chunk_text(over.chunk_index);
-            let (attrs, inner) = extract_mod(chunk, &over.name);
-            let inner_loc = loc(&inner);
-            mod_decls.push_str(&format!("{attrs}mod {};\n", over.name));
-            if inner_loc < max_loc {
-                files.push(OutputFile {
-                    path: format!("{}.rs", over.name),
-                    contents: inner,
-                    loc: inner_loc,
-                });
-            } else {
-                let (nested, nested_still) = split_nested_mod(&over.name, &inner, max_loc);
-                files.extend(nested);
-                still_oversized.extend(nested_still);
-            }
+    // Body-carrying mods are extracted whole, whatever their size: packing a
+    // `#[cfg(test)] mod tests { ... }` into a cluster would nest it inside a
+    // part module and leave the root declaration ungated. The declaration —
+    // leading comments, attributes, visibility — travels to the root; the
+    // unwrapped body becomes the module's file, split further into a `{name}/`
+    // subdir when it is itself over the ceiling.
+    for &mod_index in &plan.mods {
+        let chunk = chunk_text(mod_index);
+        let name = row(mod_index).name.as_str();
+        let Some((decl, inner)) = extract_mod(chunk) else {
+            // Should not happen (the planner classified it by parsing); keep
+            // the chunk intact at the root rather than lose it.
+            mod_decls.push_str(chunk);
+            continue;
+        };
+        mod_decls.push_str(&decl);
+        // The body's `use super::*;` reaches the root's imports, so the root
+        // must keep the imports the body names.
+        root_refs.add_source(&inner);
+        let inner_loc = loc(&inner);
+        if inner_loc < max_loc {
+            files.push(OutputFile {
+                path: format!("{sub_prefix}{name}.rs"),
+                contents: inner,
+                loc: inner_loc,
+            });
         } else {
-            still_oversized.push(format!(
-                "{} ({} LOC {}, manual extraction)",
-                over.name, over.loc, over.kind
-            ));
+            let (nested, nested_still) = split_nested_mod(name, &inner, max_loc);
+            files.extend(nested.into_iter().map(|mut f| {
+                f.path = format!("{sub_prefix}{}", f.path);
+                f
+            }));
+            still_oversized.extend(nested_still);
         }
+    }
+
+    // Oversized leaves can't be moved mechanically.
+    for over in &plan.oversized {
+        still_oversized.push(format!(
+            "{} ({} LOC {}, manual extraction)",
+            over.name, over.loc, over.kind
+        ));
     }
 
     // Pull the stashed `fn main` (if any) and build the root file.
@@ -238,8 +324,23 @@ fn reassemble(
         }
     });
 
+    // The root keeps the preamble, then only the imports its own retained code
+    // references — `fn main` (if any) plus extracted module bodies, whose
+    // `use super::*;` resolves against the root. A root that is just module
+    // declarations and re-exports needs no imports at all.
+    if !root_main.trim().is_empty() {
+        root_refs.add(&root_main);
+    }
+    let root_imports = if root_refs.is_empty() {
+        String::new()
+    } else {
+        select_imports(&import_chunks, &exploded.chunks, &root_refs)
+    };
+
     let mut root = String::new();
-    root.push_str(&header);
+    root.push_str(&preamble);
+    root.push_str(&root_imports);
+    root.push_str(&root_kept);
     root.push('\n');
     root.push_str(&mod_decls);
     root.push('\n');
@@ -384,49 +485,216 @@ fn apply_inserts(text: &str, offsets: &[usize]) -> String {
     out
 }
 
-/// Split a `mod NAME { ... }` chunk into its leading attrs (for the root decl)
-/// and its inner body (for the extracted file). Best-effort, line-based.
-fn extract_mod(chunk_text: &str, name: &str) -> (String, String) {
-    let open = format!("mod {name}");
-    let lines: Vec<&str> = chunk_text.split_inclusive('\n').collect();
-    let mut decl_line = None;
-    for (i, line) in lines.iter().enumerate() {
-        if line.trim_start().starts_with(&open) {
-            decl_line = Some(i);
-            break;
-        }
+/// Assemble a part file: its selected imports, the sibling glob so it can reach
+/// the rest of the module via the root re-exports, then the moved items.
+fn part_file(imports: &str, sibling: &str, body: &str) -> String {
+    if imports.trim().is_empty() {
+        format!("use {sibling}::*;\n\n{body}")
+    } else {
+        format!("{imports}\nuse {sibling}::*;\n\n{body}")
     }
-    let Some(decl) = decl_line else {
-        return (String::new(), chunk_text.to_owned());
+}
+
+/// The glob re-export line for a module given the widest visibility of its
+/// items — or `None` when it exposes nothing nameable (re-exporting an
+/// `impl`-only module would only warn).
+fn reexport_line(vis: ExportVis, module: &str) -> Option<String> {
+    match vis {
+        ExportVis::None => None,
+        ExportVis::Crate => Some(format!("pub(crate) use {module}::*;\n")),
+        ExportVis::Pub => Some(format!("pub use {module}::*;\n")),
+    }
+}
+
+/// What a moved item contributes to its module's glob re-export. Ordered so the
+/// widest contribution across a module's items picks the re-export visibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ExportVis {
+    /// No nameable export (a bare `impl`, a macro invocation, parse failure).
+    None,
+    /// A crate-visible name: a private item (bumped to `pub(crate)`), or one
+    /// already `pub(crate)`/`pub(super)`/`pub(in …)`.
+    Crate,
+    /// A fully public name — part of the crate/module's public surface.
+    Pub,
+}
+
+/// Classify one chunk's contribution to its module's glob re-export, mirroring
+/// `bump_visibility`: items it raises to `pub(crate)` count as crate-visible;
+/// `mod`/`use` are not raised, so a private one is invisible to the re-export.
+fn item_export_vis(chunk_text: &str) -> ExportVis {
+    use syn::{Item, Visibility};
+    let Ok(item) = syn::parse_str::<syn::Item>(chunk_text) else {
+        // Unparseable: bump_visibility also left it private, so a glob re-export
+        // could not see it either — contribute nothing.
+        return ExportVis::None;
     };
-    // attrs = the `#[...]` lines immediately above the decl (skip blank/comment gap)
-    let mut attrs = String::new();
-    for line in &lines[..decl] {
-        let t = line.trim_start();
-        if t.starts_with("#[") || t.starts_with("///") || t.starts_with("//!") {
-            attrs.push_str(line);
+    let (vis, bumped) = match &item {
+        Item::Fn(f) => (&f.vis, true),
+        Item::Struct(s) => (&s.vis, true),
+        Item::Enum(e) => (&e.vis, true),
+        Item::Const(c) => (&c.vis, true),
+        Item::Static(s) => (&s.vis, true),
+        Item::Trait(t) => (&t.vis, true),
+        Item::TraitAlias(t) => (&t.vis, true),
+        Item::Type(t) => (&t.vis, true),
+        Item::Union(u) => (&u.vis, true),
+        Item::Mod(m) => (&m.vis, false),
+        Item::Use(u) => (&u.vis, false),
+        // impl / macro / foreign_mod / extern_crate / verbatim: nothing nameable.
+        _ => return ExportVis::None,
+    };
+    match vis {
+        Visibility::Public(_) => ExportVis::Pub,
+        Visibility::Restricted(_) => ExportVis::Crate,
+        Visibility::Inherited if bumped => ExportVis::Crate,
+        Visibility::Inherited => ExportVis::None,
+    }
+}
+
+/// The identifiers a set of moved items references — the basis for copying only
+/// the imports they use. An item that does not re-parse flips `keep_all`, so the
+/// caller falls back to copying every import rather than dropping a needed one.
+#[derive(Default)]
+struct Refs {
+    names: std::collections::BTreeSet<String>,
+    keep_all: bool,
+}
+
+impl Refs {
+    fn add(&mut self, chunk_text: &str) {
+        match crate::referenced_idents(chunk_text) {
+            Some(names) => self.names.extend(names),
+            None => self.keep_all = true,
         }
     }
-    // inner = everything after the decl line up to (not including) the final `}`
-    let mut inner_lines = &lines[decl + 1..];
-    while inner_lines
-        .last()
-        .map(|l| l.trim().is_empty())
-        .unwrap_or(false)
-    {
-        inner_lines = &inner_lines[..inner_lines.len() - 1];
+
+    /// Add every identifier a multi-item source fragment (an extracted module
+    /// body) references.
+    fn add_source(&mut self, src: &str) {
+        match crate::referenced_idents_in_source(src) {
+            Some(names) => self.names.extend(names),
+            None => self.keep_all = true,
+        }
     }
-    // drop the closing `}` of the mod (last non-blank line)
-    if inner_lines.last().map(|l| l.trim() == "}").unwrap_or(false) {
-        inner_lines = &inner_lines[..inner_lines.len() - 1];
+
+    /// True when nothing was added — no import can be needed.
+    fn is_empty(&self) -> bool {
+        self.names.is_empty() && !self.keep_all
     }
-    (attrs, inner_lines.concat())
+
+    /// Whether an import providing `names` should be copied in. A name-less
+    /// import (`None`: a `*` glob or `as _`) is always kept, since its usage
+    /// can't be detected by name.
+    fn keeps(&self, provided: &Option<std::collections::BTreeSet<String>>) -> bool {
+        match provided {
+            None => true,
+            Some(names) => self.keep_all || names.iter().any(|n| self.names.contains(n)),
+        }
+    }
+}
+
+/// Concatenate, in source order, the import chunks referenced by `refs` (plus
+/// name-less imports like `*` globs and `as _`, always kept). This is the
+/// aggressive policy: an import whose every name is unreferenced is dropped —
+/// including an extension trait used only via its methods, whose `use` the
+/// compiler will then ask to be re-added.
+fn select_imports(import_chunks: &[usize], chunks: &[crate::Chunk], refs: &Refs) -> String {
+    let mut out = String::new();
+    for &i in import_chunks {
+        let text = chunks[i].text.as_str();
+        if refs.keeps(&import_provided_names(text)) {
+            out.push_str(text);
+        }
+    }
+    out
+}
+
+/// The names a `use`/`extern crate` chunk introduces, or `None` when it exposes
+/// nothing referenceable by name — a `*` glob or an `as _` import — which is
+/// then kept in every file rather than dropped.
+fn import_provided_names(chunk_text: &str) -> Option<std::collections::BTreeSet<String>> {
+    match syn::parse_str::<syn::Item>(chunk_text).ok()? {
+        syn::Item::Use(u) => {
+            let mut names = std::collections::BTreeSet::new();
+            let mut name_less = false;
+            collect_use_names(&u.tree, &mut names, &mut name_less);
+            if name_less { None } else { Some(names) }
+        }
+        syn::Item::ExternCrate(c) => {
+            let name = c
+                .rename
+                .map(|(_, id)| id.to_string())
+                .unwrap_or_else(|| c.ident.to_string());
+            Some(std::collections::BTreeSet::from([name]))
+        }
+        // An unparseable header chunk has no detectable name -> keep it.
+        _ => None,
+    }
+}
+
+/// Collect the bound names a `use` tree introduces. `name_less` is set for a
+/// `*` glob or an `as _` rename, which bind no referenceable name.
+fn collect_use_names(
+    tree: &syn::UseTree,
+    names: &mut std::collections::BTreeSet<String>,
+    name_less: &mut bool,
+) {
+    match tree {
+        syn::UseTree::Path(p) => collect_use_names(&p.tree, names, name_less),
+        syn::UseTree::Name(n) => {
+            names.insert(n.ident.to_string());
+        }
+        syn::UseTree::Rename(r) => {
+            if r.rename == "_" {
+                *name_less = true;
+            } else {
+                names.insert(r.rename.to_string());
+            }
+        }
+        syn::UseTree::Glob(_) => *name_less = true,
+        syn::UseTree::Group(g) => {
+            for item in &g.items {
+                collect_use_names(item, names, name_less);
+            }
+        }
+    }
+}
+
+/// Split a `mod NAME { ... }` chunk into the root-side declaration and the
+/// unwrapped inner body for the extracted file. The declaration is everything
+/// up to the mod's identifier — leading comments, attributes (a `#[cfg(test)]`
+/// gate must keep gating the declaration), and visibility (`pub mod` stays
+/// `pub mod`) — closed with `;`. Span-driven on the re-parsed chunk, so it is
+/// exact where the old line-based scan dropped the visibility. `None` when the
+/// chunk does not re-parse as a body-carrying mod.
+fn extract_mod(chunk_text: &str) -> Option<(String, String)> {
+    let Ok(syn::Item::Mod(item)) = syn::parse_str::<syn::Item>(chunk_text) else {
+        return None;
+    };
+    let (brace, _) = item.content.as_ref()?;
+    let ident_end = item.ident.span().byte_range().end;
+    let decl = format!("{};\n", &chunk_text[..ident_end]);
+
+    let open_end = brace.span.open().byte_range().end;
+    let close_start = brace.span.close().byte_range().start;
+    let inner = &chunk_text[open_end..close_start];
+    // Drop the newline that followed `{` and the closing brace's indentation.
+    let inner = inner.strip_prefix('\n').unwrap_or(inner);
+    let mut inner = inner.trim_end_matches([' ', '\t']).to_owned();
+    if !inner.is_empty() && !inner.ends_with('\n') {
+        inner.push('\n');
+    }
+    Some((decl, inner))
 }
 
 /// Recursively split an over-budget module's inner body into a `{name}/`
 /// subdirectory: `{name}/mod.rs` forwards the enclosing module's items
-/// (`pub(crate) use super::*`) and re-exports the clusters; each `{name}/gNN.rs`
-/// holds a cohesive cluster and reaches everything via `super::*`. Used for big
+/// (`pub(crate) use super::*`), keeps the body's own re-exports and `mod`
+/// declarations verbatim, and re-exports the clusters; each `{name}/gNN.rs`
+/// holds a cohesive cluster and reaches everything via `super::*`. A nested
+/// body-carrying mod is extracted whole (attributes and visibility on its
+/// declaration), recursing when it is itself over the ceiling. Used for big
 /// test modules.
 fn split_nested_mod(name: &str, inner: &str, max_loc: usize) -> (Vec<OutputFile>, Vec<String>) {
     let Ok(exploded) = crate::explode(inner) else {
@@ -439,21 +707,39 @@ fn split_nested_mod(name: &str, inner: &str, max_loc: usize) -> (Vec<OutputFile>
             vec![format!("{name} (could not parse for nested split)")],
         );
     };
+    let row = |i: usize| {
+        exploded
+            .manifest
+            .rows
+            .iter()
+            .find(|r| r.chunk_index == i)
+            .unwrap()
+    };
 
-    // Inner header = the module's own imports, minus `use super::*` (the parent
-    // glob — `{name}/mod.rs` forwards that instead).
-    let is_super_glob = |t: &str| t.replace(' ', "").contains("usesuper::*;");
-    let group_header: String = exploded
+    // Budget from a conservative header estimate (every use/preamble/extern
+    // chunk), then plan once. The copied group header is the plan's header —
+    // the module's own plain imports — minus `use super::*` (the parent glob,
+    // which `{name}/mod.rs` forwards instead). Re-exports and `mod`
+    // declarations are in `root_items`, kept in `{name}/mod.rs`; a nested
+    // `mod x;` still resolves to `{name}/x.rs` after the move.
+    let header_estimate: usize = exploded
         .manifest
         .rows
         .iter()
         .filter(|r| matches!(r.kind.as_str(), "use" | "preamble" | "extern_crate"))
-        .map(|r| exploded.chunks[r.chunk_index].text.as_str())
+        .map(|r| r.loc)
+        .sum();
+    let item_budget = max_loc
+        .saturating_sub(header_estimate + PART_OVERHEAD)
+        .max(1);
+    let plan = plan_split(&exploded, item_budget);
+    let is_super_glob = |t: &str| t.replace(' ', "").contains("usesuper::*;");
+    let group_header: String = plan
+        .header
+        .iter()
+        .map(|&i| exploded.chunks[i].text.as_str())
         .filter(|t| !is_super_glob(t))
         .collect();
-    let header_loc = loc(&group_header);
-    let item_budget = max_loc.saturating_sub(header_loc + PART_OVERHEAD).max(1);
-    let plan = plan_split(&exploded, item_budget);
 
     let mut files = Vec::new();
     let mut decls = String::new();
@@ -474,6 +760,34 @@ fn split_nested_mod(name: &str, inner: &str, max_loc: usize) -> (Vec<OutputFile>
         decls.push_str(&format!("mod {module};\n"));
         reexports.push_str(&format!("pub(crate) use {module}::*;\n"));
     }
+    for &mod_index in &plan.mods {
+        let chunk = exploded.chunks[mod_index].text.as_str();
+        let mod_name = row(mod_index).name.as_str();
+        let Some((decl, mod_inner)) = extract_mod(chunk) else {
+            decls.push_str(chunk);
+            continue;
+        };
+        decls.push_str(&decl);
+        let mod_loc = loc(&mod_inner);
+        if mod_loc < max_loc {
+            files.push(OutputFile {
+                path: format!("{name}/{mod_name}.rs"),
+                contents: mod_inner,
+                loc: mod_loc,
+            });
+        } else {
+            let (nested, nested_still) = split_nested_mod(mod_name, &mod_inner, max_loc);
+            files.extend(nested.into_iter().map(|mut f| {
+                f.path = format!("{name}/{}", f.path);
+                f
+            }));
+            still.extend(
+                nested_still
+                    .into_iter()
+                    .map(|message| format!("{name}::{message}")),
+            );
+        }
+    }
     for over in &plan.oversized {
         still.push(format!(
             "{name}::{} ({} LOC {}, leaf needs manual extraction)",
@@ -481,7 +795,12 @@ fn split_nested_mod(name: &str, inner: &str, max_loc: usize) -> (Vec<OutputFile>
         ));
     }
 
-    let modrs = format!("pub(crate) use super::*;\n\n{decls}\n{reexports}");
+    let root_kept: String = plan
+        .root_items
+        .iter()
+        .map(|&i| exploded.chunks[i].text.as_str())
+        .collect();
+    let modrs = format!("pub(crate) use super::*;\n\n{root_kept}{decls}\n{reexports}");
     files.insert(
         0,
         OutputFile {
@@ -603,8 +922,9 @@ mod tests {
             "pub re-export preserves the API"
         );
         assert!(
-            root.contents.contains("pub(crate) use "),
-            "pub(crate) for internal refs"
+            !root.contents.contains("pub(crate) use "),
+            "a single `pub use *` caps each item at its own visibility — no \
+             redundant second `pub(crate) use` line"
         );
 
         let sub = out.files.iter().find(|f| f.path != "mod.rs").unwrap();
@@ -617,6 +937,404 @@ mod tests {
         assert!(
             sub.contents.contains("pub(crate) fn beta"),
             "private bumped to pub(crate)"
+        );
+    }
+
+    // ----- issue 1: a plain `foo.rs` file module places sub-modules in `foo/` ---
+
+    #[test]
+    fn file_module_places_submodules_in_a_subdir() {
+        // A plain `foo.rs` file module (stem != "mod"): `mod bar;` in it resolves
+        // to `foo/bar.rs`, so parts must be written under a `foo/` subdir, not as
+        // siblings of `foo.rs` (which would not compile — E0583).
+        let mut src = String::new();
+        for k in 0..3 {
+            // three items that reference nothing -> three separate parts
+            src.push_str(&format!("pub fn item{k}() -> i32 {{\n    {k}\n}}\n\n"));
+        }
+        let exploded = explode(&src).unwrap();
+        let out = split_mod(&exploded, 10_000, "wstest");
+
+        let root = out.files.iter().find(|f| f.path == "wstest.rs").unwrap();
+        assert!(
+            root.contents.contains("mod item0;"),
+            "root file-module declares the sub-modules"
+        );
+        let subs: Vec<&str> = out
+            .files
+            .iter()
+            .map(|f| f.path.as_str())
+            .filter(|p| *p != "wstest.rs")
+            .collect();
+        assert!(!subs.is_empty(), "produced sub-module files");
+        for path in &subs {
+            assert!(
+                path.starts_with("wstest/"),
+                "sub-module {path} must live under wstest/ (file-module subdir)"
+            );
+        }
+    }
+
+    #[test]
+    fn mod_rs_keeps_submodules_as_siblings() {
+        // The `foo/mod.rs` case (stem == "mod"): sub-modules stay siblings, no subdir.
+        let mut src = String::new();
+        for k in 0..3 {
+            src.push_str(&format!("pub fn item{k}() -> i32 {{\n    {k}\n}}\n\n"));
+        }
+        let exploded = explode(&src).unwrap();
+        let out = split_mod(&exploded, 10_000, "mod");
+        for f in &out.files {
+            assert!(
+                !f.path.contains('/'),
+                "mod.rs sub-modules are siblings, not in a subdir: {}",
+                f.path
+            );
+        }
+    }
+
+    // ----- issue 2: per-module pub vs pub(crate) vs no re-export decision -------
+
+    #[test]
+    fn private_only_module_reexports_pub_crate_not_pub() {
+        // No `pub` item: `pub use *` would warn "nothing public enough", so the
+        // re-export must be `pub(crate) use`.
+        let src = "fn helper() -> i32 {\n    leaf()\n}\n\nfn leaf() -> i32 {\n    1\n}\n";
+        let exploded = explode(src).unwrap();
+        let out = split_mod(&exploded, 10_000, "mod");
+        let root = out.files.iter().find(|f| f.path == "mod.rs").unwrap();
+        assert!(
+            root.contents.contains("pub(crate) use "),
+            "all-private module re-exports pub(crate):\n{}",
+            root.contents
+        );
+        assert!(
+            !root.contents.contains("pub use "),
+            "no `pub use` for a module with no public item"
+        );
+    }
+
+    #[test]
+    fn impl_only_module_is_declared_but_not_reexported() {
+        // `api` is a normal part; the bare impl references no sibling, so it
+        // clusters alone with nothing nameable -> declared, but no glob re-export
+        // (re-exporting it would only warn "doesn't reexport anything").
+        let src = "pub fn api() -> i32 {\n    1\n}\n\nimpl Worker for External {\n    fn run(&self) {}\n}\n";
+        let exploded = explode(src).unwrap();
+        let out = split_mod(&exploded, 10_000, "mod");
+        let root = out.files.iter().find(|f| f.path == "mod.rs").unwrap();
+
+        // exactly one glob re-export line (for `api`) though two modules declared
+        let reexports = root
+            .contents
+            .lines()
+            .filter(|l| l.contains(" use ") && l.trim_end().ends_with("::*;"))
+            .count();
+        assert_eq!(
+            reexports, 1,
+            "only the nameable module is re-exported:\n{}",
+            root.contents
+        );
+        assert!(root.contents.contains("pub use api::*;"));
+        assert_eq!(
+            root.contents.matches("mod ").count(),
+            2,
+            "both modules are still declared:\n{}",
+            root.contents
+        );
+    }
+
+    // ----- issue 3: crate-public entry fn is preserved as `pub use` -------------
+
+    #[test]
+    fn bin_public_entry_fn_is_reexported_pub_so_it_stays_crate_visible() {
+        // A lib crate root where `run` is the public entry (the bin calls
+        // `crate_name::run`). It must be re-exported `pub`, not `pub(crate)`, or
+        // `crate_name::run` is no longer visible to main.rs after the split.
+        let src = "fn helper() -> i32 {\n    1\n}\n\npub fn run() -> i32 {\n    helper()\n}\n";
+        let exploded = explode(src).unwrap();
+        let out = split_bin(&exploded, 10_000, "lib");
+
+        let root = out.files.iter().find(|f| f.path == "lib.rs").unwrap();
+        assert!(
+            root.contents.contains("pub use "),
+            "public `run` re-exported at pub keeps `crate::run` visible:\n{}",
+            root.contents
+        );
+        assert!(
+            !root.contents.contains("pub(crate) use "),
+            "the module has a pub item, so one `pub use *` suffices (no double line)"
+        );
+    }
+
+    // ----- preamble (inner `//!`/`#![…]`) stays at the root, not copied to parts -
+
+    #[test]
+    fn crate_preamble_stays_at_root_not_copied_into_parts() {
+        // `#![allow]` / `//!` belong at the crate root (and `#![feature]` is a
+        // hard error anywhere else); a crate-root attr already covers sub-modules.
+        let src = "//! crate docs\n#![allow(dead_code)]\n\npub fn alpha() -> i32 {\n    beta()\n}\n\nfn beta() -> i32 {\n    1\n}\n";
+        let exploded = explode(src).unwrap();
+        let out = split_bin(&exploded, 10_000, "lib");
+
+        let root = out.files.iter().find(|f| f.path == "lib.rs").unwrap();
+        assert!(
+            root.contents.contains("#![allow(dead_code)]"),
+            "preamble stays at the root"
+        );
+        for f in &out.files {
+            if f.path != "lib.rs" {
+                assert!(
+                    !f.contents.contains("#!["),
+                    "part {} must not carry crate-level inner attrs",
+                    f.path
+                );
+                assert!(
+                    !f.contents.contains("//! crate docs"),
+                    "part {} must not duplicate the crate docs",
+                    f.path
+                );
+            }
+        }
+    }
+
+    // ----- issue 3a: copy only the imports each file actually references -------
+
+    #[test]
+    fn parts_copy_only_the_imports_they_reference() {
+        // alpha names `Display`; bravo names nothing from the header. Each part
+        // gets only the imports it references.
+        let src = "use std::fmt::Display;\nuse std::collections::HashMap;\n\npub fn alpha(d: &dyn Display) {\n    let _ = d;\n}\n\npub fn bravo() -> i32 {\n    1\n}\n";
+        let exploded = explode(src).unwrap();
+        let out = split_mod(&exploded, 10_000, "mod");
+
+        let alpha = out
+            .files
+            .iter()
+            .find(|f| f.contents.contains("fn alpha"))
+            .unwrap();
+        let bravo = out
+            .files
+            .iter()
+            .find(|f| f.contents.contains("fn bravo"))
+            .unwrap();
+        assert!(
+            alpha.contents.contains("use std::fmt::Display;"),
+            "alpha references Display:\n{}",
+            alpha.contents
+        );
+        assert!(
+            !alpha.contents.contains("HashMap"),
+            "alpha never names HashMap -> import dropped:\n{}",
+            alpha.contents
+        );
+        assert!(
+            !bravo.contents.contains("use std::fmt::Display;"),
+            "bravo references nothing from the header:\n{}",
+            bravo.contents
+        );
+        assert!(!bravo.contents.contains("HashMap"));
+    }
+
+    #[test]
+    fn globs_and_anonymous_trait_imports_are_always_copied() {
+        // `use ...::*` and `use Trait as _` expose no name to match, so every
+        // part keeps them — the safe choice for a trait used only via methods.
+        let src = "use std::fmt::Write as _;\nuse std::prelude::v1::*;\n\npub fn writes(s: &mut String) {\n    let _ = write!(s, \"x\");\n}\n\npub fn other() -> i32 {\n    2\n}\n";
+        let exploded = explode(src).unwrap();
+        let out = split_mod(&exploded, 10_000, "mod");
+        for f in &out.files {
+            if f.path == "mod.rs" {
+                continue;
+            }
+            assert!(
+                f.contents.contains("use std::fmt::Write as _;"),
+                "{} must keep the `as _` trait import:\n{}",
+                f.path,
+                f.contents
+            );
+            assert!(
+                f.contents.contains("use std::prelude::v1::*;"),
+                "{} must keep the glob import:\n{}",
+                f.path,
+                f.contents
+            );
+        }
+    }
+
+    #[test]
+    fn item_less_root_keeps_no_imports() {
+        // A module root whose items all moved out is just decls + re-exports; it
+        // needs no imports, while the part that uses one keeps it.
+        let src = "use std::collections::HashMap;\n\npub fn solo(m: HashMap<u8, u8>) {\n    let _ = m;\n}\n";
+        let exploded = explode(src).unwrap();
+        let out = split_mod(&exploded, 10_000, "mod");
+
+        let root = out.files.iter().find(|f| f.path == "mod.rs").unwrap();
+        assert!(
+            !root.contents.contains("use std::collections::HashMap;"),
+            "item-less root drops imports it doesn't use:\n{}",
+            root.contents
+        );
+        let part = out.files.iter().find(|f| f.path != "mod.rs").unwrap();
+        assert!(
+            part.contents.contains("use std::collections::HashMap;"),
+            "the part that uses HashMap keeps it"
+        );
+    }
+
+    // ----- razel regression 1: source re-exports must stay `pub use` at root --
+
+    #[test]
+    fn source_pub_use_reexports_stay_pub_use_at_the_root() {
+        // The original file's `pub use` lines ARE the crate's public API.
+        // Treating them as droppable header imports (or demoting them to
+        // `pub(crate) use`) silently breaks every dependent's paths.
+        let src = "mod helpers;\n\npub use helpers::Helper;\n\nuse std::fmt::Display;\n\n\
+                   pub fn api(d: &dyn Display) {\n    let _ = d;\n}\n";
+        let exploded = explode(src).unwrap();
+        let out = split_bin(&exploded, 10_000, "lib");
+
+        let root = out.files.iter().find(|f| f.path == "lib.rs").unwrap();
+        assert!(
+            root.contents.contains("mod helpers;"),
+            "content-less mod decl stays at the root (it binds helpers.rs):\n{}",
+            root.contents
+        );
+        assert!(
+            root.contents.contains("pub use helpers::Helper;"),
+            "source re-export stays verbatim at the root:\n{}",
+            root.contents
+        );
+        assert!(
+            !root.contents.contains("pub(crate) use helpers"),
+            "a source re-export must never be demoted"
+        );
+        for f in &out.files {
+            if f.path != "lib.rs" {
+                assert!(
+                    !f.contents.contains("pub use helpers::Helper;"),
+                    "{} must not carry the root's re-export",
+                    f.path
+                );
+                assert!(
+                    !f.contents.contains("mod helpers;"),
+                    "{} must not carry the root's mod decl (would look for a \
+                     sibling subdir file)",
+                    f.path
+                );
+            }
+        }
+    }
+
+    // ----- razel regression 2: the cfg(test) gate travels with the tests mod --
+
+    #[test]
+    fn under_budget_cfg_test_mod_is_extracted_whole_with_its_gate() {
+        // The razel failure: the tests mod fit under the item budget, so it was
+        // CLUSTERED — wrapped inside a part module with an ungated root decl —
+        // instead of extracted. A body mod must always move whole, its
+        // `#[cfg(test)]` gating the root declaration.
+        let src = "pub fn alpha() -> i32 {\n    1\n}\n\n\
+                   #[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    \
+                   fn smoke() {\n        assert_eq!(alpha(), 1);\n    }\n}\n";
+        let exploded = explode(src).unwrap();
+        // Budget far above the tests mod's size: it would have been clustered.
+        let out = split_bin(&exploded, 10_000, "lib");
+
+        let root = out.files.iter().find(|f| f.path == "lib.rs").unwrap();
+        assert!(
+            root.contents.contains("#[cfg(test)]\nmod tests;"),
+            "the gate must travel to the root declaration:\n{}",
+            root.contents
+        );
+        assert!(
+            !root.contents.contains("use tests::*"),
+            "an extracted mod is declared, not glob re-exported:\n{}",
+            root.contents
+        );
+        let tests = out.files.iter().find(|f| f.path == "tests.rs").unwrap();
+        assert!(tests.contents.contains("fn smoke()"));
+        assert!(
+            !tests.contents.contains("mod tests"),
+            "the body is unwrapped — no double nesting:\n{}",
+            tests.contents
+        );
+    }
+
+    #[test]
+    fn pub_mod_keeps_its_visibility_on_the_extracted_decl() {
+        let src = "pub fn api() -> i32 {\n    1\n}\n\n\
+                   /// Config store.\npub mod config {\n    pub fn get() -> i32 {\n        2\n    }\n}\n";
+        let exploded = explode(src).unwrap();
+        let out = split_bin(&exploded, 10_000, "lib");
+
+        let root = out.files.iter().find(|f| f.path == "lib.rs").unwrap();
+        assert!(
+            root.contents.contains("/// Config store.\npub mod config;"),
+            "docs and `pub` travel to the declaration:\n{}",
+            root.contents
+        );
+        let config = out.files.iter().find(|f| f.path == "config.rs").unwrap();
+        assert!(config.contents.contains("pub fn get()"));
+    }
+
+    #[test]
+    fn part_colliding_with_an_extracted_mod_name_is_renamed() {
+        // `fn tests` (value namespace) and `mod tests` (type namespace) can
+        // coexist in the source; the extracted mod owns `tests.rs`, so the
+        // part named after the fn must yield.
+        let src = "fn tests() -> i32 {\n    1\n}\n\n\
+                   #[cfg(test)]\nmod tests {\n    fn smoke() {}\n}\n";
+        let exploded = explode(src).unwrap();
+        let out = split_bin(&exploded, 10_000, "lib");
+
+        let paths: Vec<&str> = out.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"tests.rs"), "extracted mod file: {paths:?}");
+        assert!(paths.contains(&"tests_.rs"), "renamed part file: {paths:?}");
+        let root = out.files.iter().find(|f| f.path == "lib.rs").unwrap();
+        assert!(root.contents.contains("mod tests_;"));
+        assert!(root.contents.contains("#[cfg(test)]\nmod tests;"));
+    }
+
+    #[test]
+    fn root_keeps_imports_an_extracted_mod_body_references() {
+        // The extracted tests mod reaches the root's imports via
+        // `use super::*;` — dropping HashMap from the root would break it.
+        let src = "use std::collections::HashMap;\n\n\
+                   pub fn alpha() -> i32 {\n    1\n}\n\n\
+                   #[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    \
+                   fn smoke() {\n        let _m: HashMap<u8, u8> = HashMap::new();\n        \
+                   assert_eq!(alpha(), 1);\n    }\n}\n";
+        let exploded = explode(src).unwrap();
+        let out = split_bin(&exploded, 10_000, "lib");
+
+        let root = out.files.iter().find(|f| f.path == "lib.rs").unwrap();
+        assert!(
+            root.contents.contains("use std::collections::HashMap;"),
+            "root must keep imports the extracted body names:\n{}",
+            root.contents
+        );
+    }
+
+    #[test]
+    fn bin_root_keeps_only_imports_main_references() {
+        // `main` names `exit` but not `HashMap` (the moved `worker` does), so the
+        // root keeps `exit` and drops `HashMap`.
+        let src = "use std::process::exit;\nuse std::collections::HashMap;\n\nfn worker() -> HashMap<u8, u8> {\n    HashMap::new()\n}\n\nfn main() {\n    let _ = worker();\n    exit(0);\n}\n";
+        let exploded = explode(src).unwrap();
+        let out = split_bin(&exploded, 10_000, "main");
+
+        let root = out.files.iter().find(|f| f.path == "main.rs").unwrap();
+        assert!(
+            root.contents.contains("use std::process::exit;"),
+            "main references exit:\n{}",
+            root.contents
+        );
+        assert!(
+            !root.contents.contains("HashMap"),
+            "main never names HashMap (worker does) -> dropped from root:\n{}",
+            root.contents
         );
     }
 }

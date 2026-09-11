@@ -8,6 +8,24 @@ layout that stays under a requested LOC ceiling.
 It does not decide when a file should be split. Use your project's own rule for
 that decision, then run this tool when you want the mechanical carve-out.
 
+## Suggested Split Policy
+
+`rust-split` ships with a suggested policy for teams and agents that do not
+already have one. Treat it as operating guidance, not as behavior enforced by
+the CLI:
+
+- Around 1,000 LOC, review the file's cohesion and decide whether it should be
+  split. This is a soft review trigger, not an automatic split at line 1,001.
+- When a split is warranted, target responsibility owners below 500 LOC.
+- 500 LOC is a ceiling, not a packing target. Prefer cohesive smaller files over
+  filling files toward 499 lines.
+- Split earlier when a smaller file becomes a dumping ground for unrelated
+  concepts.
+- Prefer planning ownership boundaries before implementation so large-file
+  churn does not become a separate refactor.
+
+See [SplitPolicy.md](docs/SplitPolicy.md) for the full suggested rule.
+
 ## For agents
 
 Reach for this instead of hand-editing. Moving items by cut-and-paste is O(n²) in
@@ -28,12 +46,15 @@ Loop:
    not run a formatter** — it destroys the pure-move diff; formatting is a
    separate pass.
 
-Two things the tool won't fix for you:
+`split` extracts an inline `#[cfg(test)] mod tests { … }` to its own file
+itself, the gate traveling to the root declaration. When you hand-finish from
+`explode` chunks instead, that is on you: keep the wrapper's attributes with the
+moved module and declare it as a top-level `mod` in the destination file (a
+file-module's submodule resolves to a subdir).
 
-- Keep `#[cfg(test)] mod tests { … }` in the moved file and declare it as a
-  top-level `mod` in that file (a file-module's submodule resolves to a subdir).
-- Registration blocks (`#[starlark_module]`, framework macros) need re-wrapping
-  into N blocks and re-registering by hand.
+One thing the tool won't fix for you: registration blocks
+(`#[starlark_module]`, framework macros) need re-wrapping into N blocks and
+re-registering by hand.
 
 ## Workflow
 
@@ -43,6 +64,12 @@ second (`split`) rewrites the module graph, so it intentionally adds module
 declarations, re-exports, imports, and some `pub(crate)` visibility.
 
 ## Install
+
+Install with Cargo:
+
+```sh
+cargo install rust-split
+```
 
 Install the latest release on macOS or Linux:
 
@@ -174,19 +201,45 @@ item. Each row includes:
 - LOC
 - sibling identifier references as `adjacency_hint`
 
-`split` treats `use`, `extern crate`, and file preamble chunks as a shared
-header. Other items are clustered by sibling-reference adjacency, with the LOC
-ceiling treated as a hard upper bound. Unrelated items are left separate rather
-than packed together just to reduce file count.
+`split` treats plain `use`/`extern crate` imports and the file preamble as a
+shared header. Three chunk classes never enter clustering:
 
-Generated module files over-include the shared header and import siblings through
-the generated root:
+- **Re-exports** (`pub use ...`, and any visibility-qualified import) are the
+  file's API surface and stay at the root verbatim — never dropped, never
+  demoted to `pub(crate)`.
+- **`mod name;` declarations** bind files relative to the root's directory and
+  stay at the root verbatim.
+- **Inline modules** (`mod name { ... }`, any size) are already module
+  boundaries: each is extracted whole to its own file, with its attributes
+  (`#[cfg(test)]` keeps gating the declaration), doc comments, and visibility
+  traveling to the root's `mod name;`.
+
+Everything else is clustered by sibling-reference adjacency. The LOC ceiling is
+a hard upper bound but **not a packing target**: a transitively related group
+larger than half the ceiling is partitioned into roughly equal cohesive parts
+(strongest reference edges bond first, so cuts fall on the weakest edges),
+leaning toward more, smaller files rather than one file grazing the ceiling.
+Unrelated items are left separate rather than packed together just to reduce
+file count.
+
+The file preamble (inner `//!` docs and `#![...]` attributes) stays at the root.
+Each generated file copies only the imports it references by name; `*` globs and
+`as _` trait imports, which expose no name, are kept everywhere. Modules reach
+their siblings through the generated root:
 
 - binary roots use `use crate::*`
 - nested module splits use `use super::*`
 
-Moved private items, struct fields, and inherent impl members may be bumped to
-`pub(crate)` so sibling modules can still refer to them.
+The root re-exports each module with a single glob whose visibility matches the
+module's widest item: `pub use` when it has a public item (preserving the crate's
+public surface), `pub(crate) use` otherwise, and nothing for a module that
+exposes no nameable item (such as a bare `impl`). Moved private items, struct
+fields, and inherent impl members may be bumped to `pub(crate)` so sibling
+modules can still refer to them.
+
+A plain `foo.rs` file module places its sub-modules in a `foo/` subdir — where
+`mod bar;` resolves — so the layout compiles without a manual move; a `foo/mod.rs`
+keeps its sub-modules as siblings.
 
 ## Verification
 

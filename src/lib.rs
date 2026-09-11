@@ -424,6 +424,28 @@ fn item_adjacency_candidates(item: &syn::Item) -> BTreeSet<String> {
     visitor.names
 }
 
+/// Every identifier a single top-level item references (typed visitor + raw
+/// macro idents), used by the reassembler to copy only the imports a part
+/// actually names. `None` when the chunk does not parse as an item, signalling
+/// the caller to keep all imports rather than risk dropping a needed one.
+pub(crate) fn referenced_idents(chunk_text: &str) -> Option<BTreeSet<String>> {
+    let item = syn::parse_str::<syn::Item>(chunk_text).ok()?;
+    Some(item_adjacency_candidates(&item))
+}
+
+/// Every identifier a multi-item source fragment references — used for an
+/// extracted module body, whose `use super::*;` reaches the root's imports, so
+/// the root must keep the imports the body names. `None` when the fragment does
+/// not parse, signalling the caller to keep all imports.
+pub(crate) fn referenced_idents_in_source(src: &str) -> Option<BTreeSet<String>> {
+    let file = syn::parse_str::<syn::File>(src).ok()?;
+    let mut names = BTreeSet::new();
+    for item in &file.items {
+        names.extend(item_adjacency_candidates(item));
+    }
+    Some(names)
+}
+
 /// Recursively collect every identifier in a macro's token stream.
 fn collect_macro_idents(tokens: &proc_macro2::TokenStream, names: &mut BTreeSet<String>) {
     for tree in tokens.clone() {

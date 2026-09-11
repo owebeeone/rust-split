@@ -26,9 +26,22 @@ For the design context, minimal config, and uv reference boundary, see
    `release.published`. Keep `workflow_dispatch` only as a repair/retry path for
    an already-published release. The workflow must not have `push` or
    `pull_request` triggers.
-9. Add `allow-dirty = ["ci"]` to `dist-workspace.toml` after the workflow edit.
+9. Add the crates.io publish job to `.github/workflows/release.yml`. It must:
+   - depend on the successful GitHub Release artifact upload
+   - run only for `release.published`, not `workflow_dispatch`
+   - authenticate with crates.io Trusted Publishing through
+     `rust-lang/crates-io-auth-action`
+   - use the temporary token only for `cargo publish`
+10. Add `allow-dirty = ["ci"]` to `dist-workspace.toml` after the workflow edit.
    This tells cargo-dist that the generated CI file is intentionally patched.
-10. Commit the generated files:
+11. Configure the crates.io Trusted Publisher for this crate after crates.io
+   allows it. Use:
+   - owner: `owebeeone`
+   - repository: `rust-split`
+   - workflow: `release.yml`
+   - environment: leave blank unless the workflow job is later given an
+     explicit GitHub Actions environment
+12. Commit the generated files:
    - `Cargo.toml`
    - `dist-workspace.toml`
    - `.github/workflows/release.yml`
@@ -94,7 +107,18 @@ dist plan
 After regenerating, reapply the trigger check to `.github/workflows/release.yml`.
 Normal commits, pull requests, and tag pushes must not start release builds.
 Release builds start when a GitHub Release is published. `workflow_dispatch`
-exists only to retry or repair an already-published release.
+exists only to retry or repair an already-published release, and must not publish
+the crate to crates.io.
+
+Crates.io publishing must not be done from a local checkout. Local commands are
+for verification only. The real publish is the `publish-crate` job in
+`.github/workflows/release.yml`, and that job is restricted to the
+`release.published` event.
+
+crates.io Trusted Publishing may require the crate to exist before the trusted
+publisher can be configured. If the first crate version cannot be published with
+Trusted Publishing yet, stop and decide the bootstrap path explicitly. Do not
+work around this by running `cargo publish` from a local checkout.
 
 ## Release Checklist
 
@@ -107,8 +131,12 @@ exists only to retry or repair an already-published release.
 ```sh
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
+cargo package --list
+cargo publish --dry-run
 dist plan
 ```
+
+These are verification commands only. Do not run local `cargo publish`.
 
 5. Commit the release prep.
 6. Create and push the release tag:
@@ -122,7 +150,11 @@ git push origin "v${version}"
 7. Create a GitHub Release for the pushed tag and publish it.
 8. Let the GitHub Actions release workflow build and upload artifacts to that
    existing release.
-9. On the first release, confirm the generated installer uses the expected
+9. Let the same release workflow publish the crate to crates.io. The crate
+   publish job runs after the GitHub Release artifacts are uploaded, and only for
+   the `release.published` event. Manual workflow dispatch is for repair/retry of
+   release assets only; it must not publish the crate.
+10. On the first release, confirm the generated installer uses the expected
    `RUST_SPLIT_` environment variable names before trusting the smoke tests.
    Also confirm the shell installer contains embedded checksum verification:
 
@@ -139,7 +171,7 @@ grep -q 'verify_checksum' "${tmp}/rust-split-installer.sh"
 grep -q '_checksum_value=' "${tmp}/rust-split-installer.sh"
 ```
 
-10. On the first release, inspect the generated PowerShell installer before
+11. On the first release, inspect the generated PowerShell installer before
    claiming that it verifies archive checksums:
 
 ```powershell
@@ -159,7 +191,7 @@ if (-not ($script.Contains("Get-FileHash") -or $script.Contains("checksum"))) {
 }
 ```
 
-11. Verify at least one release asset has a GitHub artifact attestation:
+12. Verify at least one release asset has a GitHub artifact attestation:
 
 ```sh
 version="0.1.0"
@@ -173,7 +205,16 @@ gh attestation verify \
   --repo owebeeone/rust-split
 ```
 
-12. After the assets are published, run the installer smoke tests below. The first
+13. Verify the crates.io install path after the workflow publishes the crate:
+
+```sh
+version="0.1.0"
+tmp="$(mktemp -d)"
+CARGO_HOME="${tmp}/cargo" cargo install rust-split --version "${version}" --locked
+"${tmp}/cargo/bin/rust-split" --version | grep -q "rust-split ${version}"
+```
+
+14. After the assets are published, run the installer smoke tests below. The first
    release has to complete CI before these tests can pass, because the scripts
    install from the public GitHub Release URLs.
 
@@ -431,14 +472,21 @@ release asset names are correct.
 
 ## Local Dry Run
 
-Before tagging, check what `cargo-dist` intends to publish:
+Before tagging, check what `cargo-dist` intends to build and what Cargo intends
+to package:
 
 ```sh
+cargo package --list
+cargo publish --dry-run
 dist plan
 dist build
 dist build --artifacts=global
 ls target/distrib
 ```
+
+These commands are local verification only. Do not run local `cargo publish`.
+The only real crates.io publish path is the GitHub Actions release workflow
+triggered by `release.published`.
 
 Local `dist build` requires git metadata, including at least one commit, because
 cargo-dist generates source archive metadata from the repository.

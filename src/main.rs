@@ -39,7 +39,8 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
 
-        /// Treat the file as a nested library module (`foo/mod.rs`), not a bin root.
+        /// Treat the file as a library module (`foo/mod.rs` or a plain `foo.rs`),
+        /// not a crate root. A `foo.rs` file module's parts go in a `foo/` subdir.
         #[arg(long)]
         module: bool,
     },

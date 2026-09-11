@@ -6,6 +6,16 @@ rust-version = "1.95"
 description = "A parser-based god-file splitter for Rust source."
 license = "GPL-2.0-only"
 repository = "https://github.com/owebeeone/rust-split"
+keywords = ["rust", "refactor", "split", "modules", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [
+    ".github/**",
+    "AGENTS.md",
+    "dev-docs/**",
+    "dist-workspace.toml",
+    "scripts/**",
+    "skills/**",
+]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

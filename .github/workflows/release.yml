@@ -292,3 +292,69 @@ jobs:
 
           gh release edit "${{ needs.plan.outputs.tag }}" --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt"
           gh release upload "${{ needs.plan.outputs.tag }}" artifacts/* --clobber
+
+  publish-crate:
+    name: Publish crate to crates.io
+    needs:
+      - plan
+      - host
+    if: ${{ github.event_name == 'release' && github.event.action == 'published' && needs.host.result == 'success' }}
+    runs-on: "ubuntu-22.04"
+    permissions:
+      "contents": "read"
+      "id-token": "write"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.plan.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: package
+        name: Validate package version
+        shell: bash
+        run: |
+          tag="${{ needs.plan.outputs.tag }}"
+          version="${tag#v}"
+          cargo_version="$(cargo metadata --locked --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "rust-split") | .version')"
+
+          if [ "$cargo_version" != "$version" ]; then
+            echo "Cargo.toml version '$cargo_version' does not match release tag '$tag'" >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - id: published
+        name: Check crates.io version
+        shell: bash
+        run: |
+          status="$(curl -L -sS -o /dev/null -w "%{http_code}" \
+            -H "User-Agent: rust-split-release-workflow" \
+            "https://crates.io/api/v1/crates/rust-split/${{ steps.package.outputs.version }}")"
+
+          case "$status" in
+            200)
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "unexpected crates.io status: $status" >&2
+              exit 1
+              ;;
+          esac
+      - name: Package check
+        if: ${{ steps.published.outputs.exists != 'true' }}
+        run: cargo package --locked
+      - id: auth
+        name: Authenticate with crates.io
+        if: ${{ steps.published.outputs.exists != 'true' }}
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish crate
+        if: ${{ steps.published.outputs.exists != 'true' }}
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      - name: Already published
+        if: ${{ steps.published.outputs.exists == 'true' }}
+        run: echo "rust-split ${{ steps.package.outputs.version }} is already published on crates.io; skipping."
