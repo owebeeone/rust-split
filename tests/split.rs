@@ -250,6 +250,119 @@ fn main() {
     assert!(status.success(), "consumer must run against the split lib");
 }
 
+/// The nested-module rejection: `rust-split split --module` on a `deep.rs`
+/// writes its parts into `deep/`, one module level *and* one directory deeper,
+/// so a copied `use super::…`, a copied `use self::…` and an `include_str!`
+/// path all have to be re-anchored. rustc is the judge — as a lib, and as a
+/// `--test` harness so the extracted `#[cfg(test)] mod tests` (which does NOT
+/// change level) is checked too.
+#[test]
+fn split_module_output_compiles_with_rebased_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    fs::create_dir_all(dir.join("docs")).unwrap();
+    fs::write(dir.join("docs/note.md"), "note\n").unwrap();
+    fs::write(
+        dir.join("lib.rs"),
+        "pub mod sibling;\npub mod top;\npub mod deep;\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("sibling.rs"),
+        "pub struct Thing;\n\npub fn alpha() -> i32 {\n    1\n}\n",
+    )
+    .unwrap();
+    fs::write(dir.join("top.rs"), "pub struct Absolute;\n").unwrap();
+
+    let god_file = r#"use super::sibling::Thing;
+use super::sibling::alpha;
+use self::local::X;
+use crate::top::Absolute;
+
+pub mod local {
+    pub struct X;
+}
+
+pub fn helper() -> i32 {
+    alpha()
+}
+
+pub fn uses_thing(t: Thing, x: X) -> i32 {
+    let _ = (t, x);
+    helper()
+}
+
+pub fn note() -> &'static str {
+    include_str!("docs/note.md")
+}
+
+pub fn marker() -> i32 {
+    let _: Option<Absolute> = None;
+    2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::helper;
+
+    #[test]
+    fn smoke() {
+        assert_eq!(helper(), 1);
+    }
+}
+"#;
+    let exploded = explode(god_file).unwrap();
+    let out = rust_split::split_mod(&exploded, MAX_LOC, "deep");
+    for f in &out.files {
+        let path = dir.join(&f.path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, &f.contents).unwrap();
+    }
+    assert!(
+        out.files.iter().any(|f| f.path.starts_with("deep/")),
+        "the file module's parts go in deep/: {:?}",
+        out.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+    );
+
+    run_rustc(
+        dir,
+        &[
+            "--edition",
+            "2024",
+            "--crate-type",
+            "lib",
+            "--crate-name",
+            "nested_fixture",
+            "lib.rs",
+            "-o",
+            dir.join("libnested_fixture.rlib").to_str().unwrap(),
+        ],
+    );
+
+    let harness = dir.join("nested_tests");
+    run_rustc(
+        dir,
+        &[
+            "--edition",
+            "2024",
+            "--test",
+            "--crate-name",
+            "nested_fixture_tests",
+            "lib.rs",
+            "-o",
+            harness.to_str().unwrap(),
+        ],
+    );
+    let tests = Command::new(&harness).output().unwrap();
+    assert!(
+        tests.status.success(),
+        "the extracted tests module must still resolve `use super::helper`:\n{}",
+        String::from_utf8_lossy(&tests.stdout)
+    );
+}
+
 fn run_rustc(dir: &Path, args: &[&str]) {
     let output = Command::new("rustc")
         .current_dir(dir)
