@@ -462,19 +462,24 @@ fn is_path_macro_call(trees: &[proc_macro2::TokenTree], index: usize) -> bool {
 /// For an `include*!` argument list: `Some(Some(offset))` is the byte offset
 /// just inside the opening quote of a re-basable relative path literal,
 /// `Some(None)` a literal that must stay put (an absolute path), and `None` an
-/// argument that is not a single plain string literal.
+/// argument that is not a single plain string literal with an optional comma.
 fn literal_insert_point(stream: &proc_macro2::TokenStream) -> Option<Option<usize>> {
     let mut trees = stream.clone().into_iter();
     let proc_macro2::TokenTree::Literal(literal) = trees.next()? else {
         return None;
     };
-    if trees.next().is_some() {
+    if let Some(token) = trees.next()
+        && (!matches!(token, proc_macro2::TokenTree::Punct(p) if p.as_char() == ',')
+            || trees.next().is_some())
+    {
         return None;
     }
     let text = literal.to_string();
     let value = syn::parse_str::<syn::LitStr>(&text).ok()?.value();
     // An absolute path does not move with the file; an empty one is not a path.
-    if value.is_empty() || value.starts_with('/') {
+    let windows_drive =
+        matches!(value.as_bytes(), [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic());
+    if value.is_empty() || value.starts_with('/') || value.starts_with(r"\\") || windows_drive {
         return Some(None);
     }
     // Insert just inside the opening quote — `"…"`, `r"…"` and `r#"…"#` alike —
@@ -759,18 +764,8 @@ fn collect_rebase_edits(
     edits: &mut Vec<(std::ops::Range<usize>, &'static str)>,
 ) {
     match tree {
-        syn::UseTree::Path(path) => {
-            let range = path.ident.span().byte_range();
-            if path.ident == "super" && matches!(rebase, Rebase::Nested) {
-                edits.push((range, "super::super"));
-            } else if path.ident == "self" {
-                match rebase {
-                    Rebase::Nested => edits.push((range, "super")),
-                    Rebase::CrateRoot => edits.push((range, "crate")),
-                    Rebase::Keep => {}
-                }
-            }
-        }
+        syn::UseTree::Path(path) => collect_anchor_edit(&path.ident, rebase, edits),
+        syn::UseTree::Rename(rename) => collect_anchor_edit(&rename.ident, rebase, edits),
         syn::UseTree::Group(group) => {
             for item in &group.items {
                 collect_rebase_edits(item, rebase, edits);
@@ -778,6 +773,20 @@ fn collect_rebase_edits(
         }
         _ => {}
     }
+}
+
+fn collect_anchor_edit(
+    ident: &syn::Ident,
+    rebase: Rebase,
+    edits: &mut Vec<(std::ops::Range<usize>, &'static str)>,
+) {
+    let replacement = match (ident.to_string().as_str(), rebase) {
+        ("super", Rebase::Nested) => "super::super",
+        ("self", Rebase::Nested) => "super",
+        ("self", Rebase::CrateRoot) => "crate",
+        _ => return,
+    };
+    edits.push((ident.span().byte_range(), replacement));
 }
 
 /// Replace the given (non-overlapping, possibly empty) byte ranges in `text`.
@@ -800,67 +809,47 @@ fn apply_replacements(text: &str, edits: &[(std::ops::Range<usize>, &str)]) -> S
 }
 
 /// Re-anchor the `super::` / `self::` paths *inside* a moved item — expression
-/// and type paths, function-local `use` items, macro arguments — for a body that
-/// lands one module level below the file it came from. Token-driven, so a path
-/// spelled in a comment or a string is never touched.
-///
-/// Only the *leading* segment of a path moves, which is what the two guards
-/// enforce: a segment preceded by `::` is already anchored by the one before it
-/// (`super::super::x` gains exactly one level), and a `self` not followed by
-/// `::` is not a module anchor at all — a receiver (`self.n`), a `use
-/// …::{self, …}` group member, or a `pub(self)` restriction.
+/// and type paths, function-local `use` items, and macro invocation paths — for
+/// a body that lands one module level below its original file. Macro input and
+/// attribute tokens are opaque; only parsed Rust paths are rewritten. Comments,
+/// strings, receivers, and visibility restrictions stay byte-exact.
 fn rebase_body_paths(body: &str, rebase: Rebase) -> String {
     if matches!(rebase, Rebase::Keep) {
         return body.to_owned();
     }
-    let Ok(stream) = body.parse::<proc_macro2::TokenStream>() else {
+    let Ok(file) = syn::parse_file(body) else {
         return body.to_owned();
     };
-    let mut edits = Vec::new();
-    collect_path_edits(stream, rebase, &mut edits);
-    apply_replacements(body, &edits)
-}
-
-fn collect_path_edits(
-    stream: proc_macro2::TokenStream,
-    rebase: Rebase,
-    edits: &mut Vec<(std::ops::Range<usize>, &'static str)>,
-) {
-    let trees: Vec<proc_macro2::TokenTree> = stream.into_iter().collect();
-    for (index, tree) in trees.iter().enumerate() {
-        let proc_macro2::TokenTree::Ident(ident) = tree else {
-            if let proc_macro2::TokenTree::Group(group) = tree {
-                collect_path_edits(group.stream(), rebase, edits);
-            }
-            continue;
-        };
-        if !starts_a_path_prefix(&trees, index) {
-            continue;
-        }
-        // `pub(super)` / `pub(self)` never reach here: no `::` follows them.
-        let replacement = match (ident.to_string().as_str(), rebase) {
-            ("super", Rebase::Nested) => "super::super",
-            ("self", Rebase::Nested) => "super",
-            ("self", Rebase::CrateRoot) => "crate",
-            // A crate root has no `super::`, so nothing else can move.
-            _ => continue,
-        };
-        edits.push((ident.span().byte_range(), replacement));
-    }
-}
-
-/// Whether the ident at `index` is the first segment of a path: a `::` follows
-/// it and none precedes it. A separator is *two* colon tokens — a lone `:` is a
-/// type annotation or a struct field init, and the segment after it still
-/// starts a path (`meta: super::x`).
-fn starts_a_path_prefix(trees: &[proc_macro2::TokenTree], index: usize) -> bool {
-    let colon = |offset: usize| match trees.get(offset) {
-        Some(proc_macro2::TokenTree::Punct(punct)) => punct.as_char() == ':',
-        _ => false,
+    let mut visitor = BodyPathEdits {
+        rebase,
+        edits: Vec::new(),
     };
-    let followed = colon(index + 1) && colon(index + 2);
-    let preceded = index >= 2 && colon(index - 1) && colon(index - 2);
-    followed && !preceded
+    syn::visit::Visit::visit_file(&mut visitor, &file);
+    apply_replacements(body, &visitor.edits)
+}
+
+struct BodyPathEdits {
+    rebase: Rebase,
+    edits: Vec<(std::ops::Range<usize>, &'static str)>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for BodyPathEdits {
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        if path.leading_colon.is_none() && path.segments.len() > 1 {
+            collect_anchor_edit(&path.segments[0].ident, self.rebase, &mut self.edits);
+        }
+        syn::visit::visit_path(self, path);
+    }
+
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        if item.leading_colon.is_none() {
+            collect_rebase_edits(&item.tree, self.rebase, &mut self.edits);
+        }
+    }
+
+    fn visit_attribute(&mut self, _: &'ast syn::Attribute) {}
+
+    fn visit_visibility(&mut self, _: &'ast syn::Visibility) {}
 }
 
 /// Concatenate, in source order, the import chunks referenced by `refs` (plus
@@ -1840,6 +1829,103 @@ pub fn rooted() -> &'static str {
     }
 
     // ----- issue 4b: relative paths *inside* a moved body move with it --------
+
+    #[test]
+    fn review_body_paths_preserve_opaque_macro_and_attribute_tokens() {
+        let src = r#"#[metadata(super::Thing)]
+pub fn probe() -> super::Thing {
+    macro_rules! data { () => { self::Thing }; }
+    let _ = stringify!(super::Thing);
+    let _ = stringify! { self::Thing };
+    let _ = custom!(super::Thing, (self::Thing), stringify!(super::Thing));
+    let _ = super::factory!(self::Thing);
+    <super::Thing as self::Trait>::make()
+}
+"#;
+        let expected = src
+            .replace("-> super::Thing", "-> super::super::Thing")
+            .replace("super::factory!", "super::super::factory!")
+            .replace(
+                "<super::Thing as self::Trait>",
+                "<super::super::Thing as super::Trait>",
+            );
+        assert_eq!(rebase_body_paths(src, Rebase::Nested), expected);
+        assert_eq!(rebase_body_paths(src, Rebase::Keep), src);
+    }
+
+    #[test]
+    fn review_renamed_use_anchors_rebase_in_headers_and_bodies() {
+        for (source, nested, root) in [
+            (
+                "super as parent",
+                "super::super as parent",
+                "super as parent",
+            ),
+            ("self as current", "super as current", "crate as current"),
+            (
+                "{super as parent, self as current, super::{self as p, Thing}}",
+                "{super::super as parent, super as current, super::super::{self as p, Thing}}",
+                "{super as parent, crate as current, super::{self as p, Thing}}",
+            ),
+            ("crate as root", "crate as root", "crate as root"),
+        ] {
+            for (rebase, expected) in [
+                (Rebase::Nested, nested),
+                (Rebase::CrateRoot, root),
+                (Rebase::Keep, source),
+            ] {
+                let import =
+                    format!("// keep this comment\n#[allow(unused_imports)]\nuse {source};\n");
+                let expected = import.replace(source, expected);
+                assert_eq!(rebase_import(&import, rebase), expected);
+                assert_eq!(
+                    rebase_body_paths(&format!("fn probe() {{\n{import}}}"), rebase),
+                    format!("fn probe() {{\n{expected}}}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn review_include_literals_accept_one_optional_trailing_comma() {
+        for name in PATH_MACROS {
+            for literal in [r#""docs/file""#, r##"r#"docs/file"#"##] {
+                let src = format!("fn probe() {{ {name}!({literal} /* keep */,); }}");
+                assert_eq!(
+                    rebase_includes(&src, 2, "foo/part.rs"),
+                    src.replace("docs/file", "../../docs/file"),
+                );
+                for suffix in [",,", ", other", " + other"] {
+                    let src = format!("fn probe() {{ {name}!({literal}{suffix}); }}");
+                    assert_eq!(rebase_includes(&src, 1, "foo/part.rs"), src);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn review_include_absolute_windows_paths_are_host_independent() {
+        for name in PATH_MACROS {
+            for literal in [
+                r#""C:\\docs\\file""#,
+                r#""z:/docs/file""#,
+                r#"r"C:\docs\file""#,
+                r#""\\\\server\\share\\file""#,
+                r#"r"\\server\share\file""#,
+                r#"r"\\?\C:\docs\file""#,
+                r#""//server/share/file""#,
+                r#""/docs/file""#,
+            ] {
+                let src = format!("fn probe() {{ {name}!({literal}); }}");
+                assert_eq!(rebase_includes(&src, 1, "foo/part.rs"), src);
+            }
+            let src = format!("fn probe() {{ {name}!(\"C:relative\"); }}");
+            assert_eq!(
+                rebase_includes(&src, 1, "foo/part.rs"),
+                src.replace("C:relative", "../C:relative"),
+            );
+        }
+    }
 
     #[test]
     fn moved_body_paths_gain_one_super_level() {

@@ -268,13 +268,15 @@ API preservation.
 - `adjacency_hint` is syntactic. It records sibling identifier references, not a
   full semantic call graph, so shadowing and macro expansion can affect grouping.
 - Registration macros or framework-specific blocks may need manual treatment.
+  Relative module paths in macro input and attribute tokens are left verbatim.
 - Large leaf items cannot be split internally; they are reported as still
   oversized.
 - A `#[path = "…"]` declaration in the parent changes where rustc looks for the
   generated sub-modules, so a `#[path]`-declared module must be split with the
   attribute removed (one line in the parent) or the output moved by hand.
 - `include!` / `include_str!` / `include_bytes!` paths are re-based only when the
-  argument is a single plain string literal holding a relative path. An absolute
-  path is left alone, and a computed argument — `concat!(env!("CARGO_MANIFEST_DIR"),
+  argument is a single plain string literal (with an optional trailing comma)
+  holding a relative path. An absolute path is left alone, and a computed
+  argument — `concat!(env!("CARGO_MANIFEST_DIR"),
   …)`, a macro, a constant — cannot be re-based mechanically: it is left verbatim
   and reported on stderr with the generated file and line to check.

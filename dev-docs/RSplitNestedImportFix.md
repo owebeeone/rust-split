@@ -1,6 +1,6 @@
 # rust-split 0.1.4 — nested-module import paths and include! paths (fix brief)
 
-Status: DRAFT brief for an implementing agent. Nothing here is done yet.
+Status: Implemented; original measurements and review-fix verification below.
 Written 2026-09-12 from the empirical run recorded in
 `garnets-wz/dev-docs/gwz-go-to-market/research/rust-split-landscape.md`
 (private repo; the relevant numbers are copied below).
@@ -232,3 +232,17 @@ That is what takes the first file to 0.
 Known not covered: a `pub(super)` restriction on a moved item narrows when the
 item moves (it should become `pub(in super::super)`); it is left as it is. No
 occurrence in either real file.
+
+### Review fixes (2026-09-12)
+
+All four focused regressions failed before the fixes and now pass: opaque macro
+and attribute tokens survive body-path rebasing; renamed `self`/`super` imports
+rebase in headers and bodies; include literals accept one trailing comma; Windows
+drive-absolute and UNC paths stay unchanged on every host. Body-path rebasing now
+visits parsed Rust paths only; paths inside macro input may need manual repair.
+This supersedes the broad macro-argument rewriting described above.
+
+`cargo fmt --all -- --check`, `cargo test` (41 library + 12 explode + 6 split
+tests), and `cargo clippy --all-targets --all-features -- -D warnings` pass.
+Production code shrank by 11 lines; regression tests added 97 lines. The earlier
+GWZ measurements were not rerun, and `/Users/owebeeone/limbo/gwz-dev` was untouched.
