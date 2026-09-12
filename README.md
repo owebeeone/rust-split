@@ -241,6 +241,14 @@ A plain `foo.rs` file module places its sub-modules in a `foo/` subdir — where
 `mod bar;` resolves — so the layout compiles without a manual move; a `foo/mod.rs`
 keeps its sub-modules as siblings.
 
+Because a generated part is a module *below* the file it came from, the imports
+copied into it are re-anchored: a `use super::…` gains one `super::`, and a
+`use self::…` becomes `use super::…` (or `use crate::…` below a crate root).
+`crate::`, `::`-rooted and external paths are untouched, and the root file — still
+the original module — keeps its header verbatim. For the same reason, a relative
+`include!` / `include_str!` / `include_bytes!` path in a body that moved into a
+subdirectory gains one `../` per level.
+
 ## Verification
 
 Run the tool's own checks with:
@@ -262,3 +270,11 @@ API preservation.
 - Registration macros or framework-specific blocks may need manual treatment.
 - Large leaf items cannot be split internally; they are reported as still
   oversized.
+- A `#[path = "…"]` declaration in the parent changes where rustc looks for the
+  generated sub-modules, so a `#[path]`-declared module must be split with the
+  attribute removed (one line in the parent) or the output moved by hand.
+- `include!` / `include_str!` / `include_bytes!` paths are re-based only when the
+  argument is a single plain string literal holding a relative path. An absolute
+  path is left alone, and a computed argument — `concat!(env!("CARGO_MANIFEST_DIR"),
+  …)`, a macro, a constant — cannot be re-based mechanically: it is left verbatim
+  and reported on stderr with the generated file and line to check.
