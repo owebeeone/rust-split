@@ -1,5 +1,10 @@
 # rust-split release process plan
 
+> This document records the release workflow design and implementation details.
+> For the current operator process, use [`RELEASE.md`](../RELEASE.md) and
+> `gearu.toml`. Gearu now handles version updates, verification, the release
+> commit, and tag creation described manually below.
+
 This plan describes how to cut releases for `rust-split` once `cargo-dist` is
 configured.
 

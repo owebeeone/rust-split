@@ -1,0 +1,29 @@
+[project]
+name = "rust-split"
+branch = "main"
+remote = "origin"
+tag_prefix = "v"
+github_repo = "owebeeone/rust-split"
+
+[rust]
+manifests = ["Cargo.toml"]
+lockfile = "Cargo.lock"
+lock_command = ["cargo", "generate-lockfile"]
+
+[release]
+checks = [
+    ["cargo", "fmt", "--all", "--", "--check"],
+    ["cargo", "test", "--locked"],
+    ["cargo", "clippy", "--all-targets", "--all-features", "--", "-D", "warnings"],
+    ["cargo", "package", "--list"],
+    ["cargo", "publish", "--dry-run", "--locked", "--allow-dirty"],
+]
+exact_checks = [
+    ["cargo", "fmt", "--all", "--", "--check"],
+    ["cargo", "test", "--locked"],
+    ["cargo", "clippy", "--all-targets", "--all-features", "--", "-D", "warnings"],
+    ["cargo", "package", "--list"],
+    ["cargo", "publish", "--dry-run", "--locked"],
+]
+commit_message = "chore(release): rust-split {version}"
+github_notes = "rust-split {tag}. Publishing this release triggers the binary and crates.io release workflow."

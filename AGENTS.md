@@ -10,3 +10,17 @@ These rules apply to work in this repository.
 - Keep split changes reviewable. Do not combine relocation, formatting, renaming, and feature behavior in one diff unless the task explicitly requires it.
 - Never publish to crates.io from a local checkout. Real crate publishing belongs only in the GitHub Actions release workflow triggered by `release.published`.
 - Local crates.io checks must be non-mutating: use `cargo package --list` and `cargo publish --dry-run`, never `cargo publish`.
+
+<!-- gearu:agents:start -->
+## Releases
+
+- This repository uses [Gearu](https://owebeeone.github.io/gearu/) for release
+  preparation.
+- Read `RELEASE.md` before planning or performing a release.
+- `gearu plan VERSION` and `gearu plan --bump LEVEL` are read-only. Do not run
+  `gearu release`, push a release tag, or create a GitHub Release unless the
+  user explicitly requests it.
+- Never move or reuse a release tag. Correct released content with a new version.
+- Never publish directly to PyPI, crates.io, or npm from a local checkout.
+  Registry publication belongs in the repository's release workflow.
+<!-- gearu:agents:end -->
