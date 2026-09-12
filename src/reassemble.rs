@@ -367,10 +367,117 @@ fn reassemble(
         },
     );
 
+    // `include!`/`include_str!`/`include_bytes!` resolve their argument against
+    // the directory of the file that contains them, so a body written into a
+    // subdirectory needs one `../` per level it moved down. The root file did
+    // not move (no `/` in its path), and neither did a part that stayed a
+    // sibling. Inserting `../` adds no lines, so `loc` is unaffected.
+    for file in &mut files {
+        let levels = file.path.matches('/').count();
+        if levels == 0 || !file.contents.contains("include") {
+            continue;
+        }
+        file.contents = rebase_includes(&file.contents, levels, &file.path);
+    }
+
     SplitOutput {
         files,
         still_oversized,
     }
+}
+
+/// Macros whose single argument is a path resolved relative to the *file* that
+/// contains them — the one construct a byte-exact move cannot leave alone.
+const PATH_MACROS: [&str; 3] = ["include", "include_str", "include_bytes"];
+
+/// Re-base the relative path arguments of the `include*!` macros in a file
+/// written `levels` directories below the source file. Token-driven, so a path
+/// spelled inside a comment or an unrelated string is never touched. An
+/// absolute path is left alone; so is a non-literal argument (`concat!`,
+/// `env!`, a macro, a constant), which gets one warning line on stderr naming
+/// the generated file and line so the user knows where to look.
+fn rebase_includes(contents: &str, levels: usize, path: &str) -> String {
+    let Ok(stream) = contents.parse::<proc_macro2::TokenStream>() else {
+        return contents.to_owned();
+    };
+    let mut edits = Vec::new();
+    let prefix = "../".repeat(levels);
+    collect_include_edits(stream, &prefix, contents, path, &mut edits);
+    apply_replacements(contents, &edits)
+}
+
+/// Walk a token stream for `include*!(...)` calls, recording where a `../`
+/// prefix must be inserted and warning about the arguments that cannot be
+/// re-based mechanically.
+fn collect_include_edits<'a>(
+    stream: proc_macro2::TokenStream,
+    prefix: &'a str,
+    contents: &str,
+    path: &str,
+    edits: &mut Vec<(std::ops::Range<usize>, &'a str)>,
+) {
+    let trees: Vec<proc_macro2::TokenTree> = stream.into_iter().collect();
+    for (index, tree) in trees.iter().enumerate() {
+        let proc_macro2::TokenTree::Group(group) = tree else {
+            continue;
+        };
+        if !is_path_macro_call(&trees, index) {
+            collect_include_edits(group.stream(), prefix, contents, path, edits);
+            continue;
+        }
+        match literal_insert_point(&group.stream()) {
+            Some(Some(offset)) => edits.push((offset..offset, prefix)),
+            // A literal that must not move (absolute path): nothing to do.
+            Some(None) => {}
+            None => {
+                let line = contents[..group.span().byte_range().start].lines().count();
+                eprintln!(
+                    "rust-split: {path}:{line}: {}! argument is not a plain string \
+                     literal — its path was not re-based",
+                    trees[index - 2]
+                );
+            }
+        }
+    }
+}
+
+/// Whether the group at `index` is the argument list of an `include*!` call,
+/// i.e. the two preceding tokens are the macro name and its `!`.
+fn is_path_macro_call(trees: &[proc_macro2::TokenTree], index: usize) -> bool {
+    if index < 2 {
+        return false;
+    }
+    let proc_macro2::TokenTree::Ident(name) = &trees[index - 2] else {
+        return false;
+    };
+    let proc_macro2::TokenTree::Punct(bang) = &trees[index - 1] else {
+        return false;
+    };
+    bang.as_char() == '!' && PATH_MACROS.iter().any(|m| name == m)
+}
+
+/// For an `include*!` argument list: `Some(Some(offset))` is the byte offset
+/// just inside the opening quote of a re-basable relative path literal,
+/// `Some(None)` a literal that must stay put (an absolute path), and `None` an
+/// argument that is not a single plain string literal.
+fn literal_insert_point(stream: &proc_macro2::TokenStream) -> Option<Option<usize>> {
+    let mut trees = stream.clone().into_iter();
+    let proc_macro2::TokenTree::Literal(literal) = trees.next()? else {
+        return None;
+    };
+    if trees.next().is_some() {
+        return None;
+    }
+    let text = literal.to_string();
+    let value = syn::parse_str::<syn::LitStr>(&text).ok()?.value();
+    // An absolute path does not move with the file; an empty one is not a path.
+    if value.is_empty() || value.starts_with('/') {
+        return Some(None);
+    }
+    // Insert just inside the opening quote — `"…"`, `r"…"` and `r#"…"#` alike —
+    // so the literal's own escaping is preserved byte-for-byte.
+    let quote = text.find('"')?;
+    Some(Some(literal.span().byte_range().start + quote + 1))
 }
 
 /// Raise a moved item — and the struct fields / impl members referenced across
@@ -1591,5 +1698,83 @@ mod tests {
             "the extracted body did not change module level:\n{}",
             tests.contents
         );
+    }
+
+    // ----- issue 5: include! paths resolve against the containing file --------
+
+    #[test]
+    fn include_paths_in_moved_bodies_are_rebased_one_directory_deeper() {
+        let src = r#"pub fn doc() -> &'static str {
+    include_str!("../docs/a.md")
+}
+
+pub fn blob() -> &'static [u8] {
+    include_bytes!("fixtures/b.bin")
+}
+
+pub fn built() -> &'static str {
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/x"))
+}
+
+pub fn rooted() -> &'static str {
+    include_str!("/etc/x")
+}
+"#;
+        let exploded = explode(src).unwrap();
+        let out = split_mod(&exploded, 10_000, "foo");
+
+        let moved: String = out
+            .files
+            .iter()
+            .filter(|f| f.path != "foo.rs")
+            .map(|f| f.contents.as_str())
+            .collect();
+        assert!(
+            moved.contains(r#"include_str!("../../docs/a.md")"#),
+            "a relative include! path gains one `../`:\n{moved}"
+        );
+        assert!(
+            moved.contains(r#"include_bytes!("../fixtures/b.bin")"#),
+            "a bare relative path is prefixed too:\n{moved}"
+        );
+        assert!(
+            moved.contains(r#"include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/x"))"#),
+            "a non-literal argument is byte-unchanged:\n{moved}"
+        );
+        assert!(
+            moved.contains(r#"include_str!("/etc/x")"#),
+            "an absolute path is byte-unchanged:\n{moved}"
+        );
+    }
+
+    #[test]
+    fn include_paths_are_untouched_when_the_file_stays_in_its_directory() {
+        // A crate root's parts are siblings of the root file, so no body moved
+        // between directories and no include! path may change.
+        let src = "fn worker() -> &'static str {\n    include_str!(\"../docs/w.md\")\n}\n\n\
+                   fn main() {\n    let _ = include_str!(\"../docs/m.md\");\n    \
+                   let _ = worker();\n}\n";
+        let exploded = explode(src).unwrap();
+        let out = split_bin(&exploded, 10_000, "main");
+
+        for f in &out.files {
+            assert!(
+                !f.contents.contains("../../docs/"),
+                "{} stayed in the source directory:\n{}",
+                f.path,
+                f.contents
+            );
+        }
+        let root = out.files.iter().find(|f| f.path == "main.rs").unwrap();
+        assert!(root.contents.contains(r#"include_str!("../docs/m.md")"#));
+    }
+
+    #[test]
+    fn explode_never_rewrites_include_paths() {
+        // Re-basing belongs to `split`; `explode` stays byte-exact.
+        let src = "pub fn doc() -> &'static str {\n    include_str!(\"../docs/a.md\")\n}\n";
+        let exploded = explode(src).unwrap();
+        let joined: String = exploded.chunks.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(joined, src, "explode must stay lossless");
     }
 }
