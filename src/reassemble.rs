@@ -233,7 +233,10 @@ fn reassemble(
             }
             export_vis = export_vis.max(item_export_vis(chunk_text(i)));
             refs.add(chunk_text(i));
-            body.push_str(&bump_visibility(chunk_text(i)));
+            body.push_str(&rebase_body_paths(
+                &bump_visibility(chunk_text(i)),
+                part_rebase,
+            ));
         }
         // If the part was only `fn main`, it produced no module file.
         if body.trim().is_empty() {
@@ -796,6 +799,70 @@ fn apply_replacements(text: &str, edits: &[(std::ops::Range<usize>, &str)]) -> S
     out
 }
 
+/// Re-anchor the `super::` / `self::` paths *inside* a moved item — expression
+/// and type paths, function-local `use` items, macro arguments — for a body that
+/// lands one module level below the file it came from. Token-driven, so a path
+/// spelled in a comment or a string is never touched.
+///
+/// Only the *leading* segment of a path moves, which is what the two guards
+/// enforce: a segment preceded by `::` is already anchored by the one before it
+/// (`super::super::x` gains exactly one level), and a `self` not followed by
+/// `::` is not a module anchor at all — a receiver (`self.n`), a `use
+/// …::{self, …}` group member, or a `pub(self)` restriction.
+fn rebase_body_paths(body: &str, rebase: Rebase) -> String {
+    if matches!(rebase, Rebase::Keep) {
+        return body.to_owned();
+    }
+    let Ok(stream) = body.parse::<proc_macro2::TokenStream>() else {
+        return body.to_owned();
+    };
+    let mut edits = Vec::new();
+    collect_path_edits(stream, rebase, &mut edits);
+    apply_replacements(body, &edits)
+}
+
+fn collect_path_edits(
+    stream: proc_macro2::TokenStream,
+    rebase: Rebase,
+    edits: &mut Vec<(std::ops::Range<usize>, &'static str)>,
+) {
+    let trees: Vec<proc_macro2::TokenTree> = stream.into_iter().collect();
+    for (index, tree) in trees.iter().enumerate() {
+        let proc_macro2::TokenTree::Ident(ident) = tree else {
+            if let proc_macro2::TokenTree::Group(group) = tree {
+                collect_path_edits(group.stream(), rebase, edits);
+            }
+            continue;
+        };
+        if !starts_a_path_prefix(&trees, index) {
+            continue;
+        }
+        // `pub(super)` / `pub(self)` never reach here: no `::` follows them.
+        let replacement = match (ident.to_string().as_str(), rebase) {
+            ("super", Rebase::Nested) => "super::super",
+            ("self", Rebase::Nested) => "super",
+            ("self", Rebase::CrateRoot) => "crate",
+            // A crate root has no `super::`, so nothing else can move.
+            _ => continue,
+        };
+        edits.push((ident.span().byte_range(), replacement));
+    }
+}
+
+/// Whether the ident at `index` is the first segment of a path: a `::` follows
+/// it and none precedes it. A separator is *two* colon tokens — a lone `:` is a
+/// type annotation or a struct field init, and the segment after it still
+/// starts a path (`meta: super::x`).
+fn starts_a_path_prefix(trees: &[proc_macro2::TokenTree], index: usize) -> bool {
+    let colon = |offset: usize| match trees.get(offset) {
+        Some(proc_macro2::TokenTree::Punct(punct)) => punct.as_char() == ':',
+        _ => false,
+    };
+    let followed = colon(index + 1) && colon(index + 2);
+    let preceded = index >= 2 && colon(index - 1) && colon(index - 2);
+    followed && !preceded
+}
+
 /// Concatenate, in source order, the import chunks referenced by `refs` (plus
 /// name-less imports like `*` globs and `as _`, always kept), each re-anchored
 /// for where it lands. This is the aggressive policy: an import whose every name
@@ -959,7 +1026,10 @@ fn split_nested_mod(name: &str, inner: &str, max_loc: usize) -> (Vec<OutputFile>
         let module = format!("g{idx:02}");
         let mut body = String::new();
         for &ci in &part.chunk_indices {
-            body.push_str(&bump_visibility(exploded.chunks[ci].text.as_str()));
+            body.push_str(&rebase_body_paths(
+                &bump_visibility(exploded.chunks[ci].text.as_str()),
+                Rebase::Nested,
+            ));
         }
         let contents = format!("{group_header}\nuse super::*;\n\n{body}");
         files.push(OutputFile {
@@ -1767,6 +1837,119 @@ pub fn rooted() -> &'static str {
         }
         let root = out.files.iter().find(|f| f.path == "main.rs").unwrap();
         assert!(root.contents.contains(r#"include_str!("../docs/m.md")"#));
+    }
+
+    // ----- issue 4b: relative paths *inside* a moved body move with it --------
+
+    #[test]
+    fn moved_body_paths_gain_one_super_level() {
+        // The header is not the only place a relative path hides: expression and
+        // type paths, and a function-local `use`, travel inside the item.
+        let src = r#"pub fn probe() -> i32 {
+    use super::alpha::Beta;
+    let _ = Beta;
+    let _ = super::filter::parse("x");
+    let _ = super::super::grandparent::thing();
+    let _ = self::local::helper();
+    let _: super::sibling::Kind = super::sibling::make();
+    let _ = super::sibling::Record {
+        meta: super::meta::build("req"),
+    };
+    crate::top::value()
+}
+"#;
+        let exploded = explode(src).unwrap();
+        let out = split_mod(&exploded, 10_000, "foo");
+
+        let part = out.files.iter().find(|f| f.path == "foo/probe.rs").unwrap();
+        for expected in [
+            "use super::super::alpha::Beta;",
+            r#"super::super::filter::parse("x")"#,
+            // Only the leading segment moves: two levels become three, not four.
+            "super::super::super::grandparent::thing()",
+            "super::local::helper()",
+            // A lone `:` — a type annotation, a struct field init — is not a
+            // path separator, so the segment after it still starts a path.
+            "let _: super::super::sibling::Kind = super::super::sibling::make();",
+            "meta: super::super::meta::build(\"req\"),",
+            "crate::top::value()",
+        ] {
+            assert!(
+                part.contents.contains(expected),
+                "moved body must carry `{expected}`:\n{}",
+                part.contents
+            );
+        }
+    }
+
+    #[test]
+    fn moved_body_leaves_self_receivers_and_use_groups_alone() {
+        // `self` is only a module anchor when a `::` follows it: a receiver, a
+        // `use …::{self, …}` group member and a `pub(super)` restriction are all
+        // something else. (Re-anchoring a `pub(super)` restriction — which does
+        // narrow when the item moves — is out of scope here.)
+        let src = r#"pub struct Widget {
+    pub n: i32,
+}
+
+impl Widget {
+    pub fn get(&self) -> i32 {
+        use std::collections::{self, HashMap};
+        let _: Option<HashMap<u8, u8>> = None;
+        let _ = collections::BTreeMap::<u8, u8>::new();
+        let _ = Self::make();
+        self.n
+    }
+
+    pub fn make() -> Self {
+        Self { n: 1 }
+    }
+}
+
+pub(super) fn gated() -> i32 {
+    1
+}
+"#;
+        let exploded = explode(src).unwrap();
+        let out = split_mod(&exploded, 10_000, "foo");
+        let moved: String = out
+            .files
+            .iter()
+            .filter(|f| f.path != "foo.rs")
+            .map(|f| f.contents.as_str())
+            .collect();
+
+        for expected in [
+            "use std::collections::{self, HashMap};",
+            "Self::make()",
+            "self.n",
+            "pub(super) fn gated",
+        ] {
+            assert!(
+                moved.contains(expected),
+                "`{expected}` is not a module anchor and must not move:\n{moved}"
+            );
+        }
+        assert!(
+            !moved.contains("pub(super::super)"),
+            "a `pub(super)` restriction must never be mangled:\n{moved}"
+        );
+    }
+
+    #[test]
+    fn moved_body_paths_below_a_crate_root_rewrite_self_to_crate() {
+        let src = "pub fn entry() -> i32 {\n    let _ = self::helpers::setup();\n    \
+                   crate::other::value()\n}\n";
+        let exploded = explode(src).unwrap();
+        let out = split_bin(&exploded, 10_000, "lib");
+
+        let part = out.files.iter().find(|f| f.path != "lib.rs").unwrap();
+        assert!(
+            part.contents.contains("crate::helpers::setup()"),
+            "`self::` below a crate root is `crate::`:\n{}",
+            part.contents
+        );
+        assert!(part.contents.contains("crate::other::value()"));
     }
 
     #[test]
