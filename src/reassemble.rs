@@ -26,6 +26,7 @@
 //! the byte-exact moves are done here.
 
 use crate::{Exploded, SplitPlan, plan_split};
+use syn::parse::Parser;
 use syn::spanned::Spanned;
 
 /// Per-part overhead beyond the imports: the `use crate::*;` sibling glob plus
@@ -810,8 +811,9 @@ fn apply_replacements(text: &str, edits: &[(std::ops::Range<usize>, &str)]) -> S
 
 /// Re-anchor the `super::` / `self::` paths *inside* a moved item — expression
 /// and type paths, function-local `use` items, and macro invocation paths — for
-/// a body that lands one module level below its original file. Macro input and
-/// attribute tokens are opaque; only parsed Rust paths are rewritten. Comments,
+/// a body that lands one module level below its original file. Attribute and
+/// arbitrary macro input tokens are opaque; arguments to common standard
+/// expression macros are parsed before their paths are rewritten. Comments,
 /// strings, receivers, and visibility restrictions stay byte-exact.
 fn rebase_body_paths(body: &str, rebase: Rebase) -> String {
     if matches!(rebase, Rebase::Keep) {
@@ -844,6 +846,52 @@ impl<'ast> syn::visit::Visit<'ast> for BodyPathEdits {
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
         if item.leading_colon.is_none() {
             collect_rebase_edits(&item.tree, self.rebase, &mut self.edits);
+        }
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        syn::visit::Visit::visit_path(self, &mac.path);
+        let Some(name) = mac.path.segments.last().map(|segment| &segment.ident) else {
+            return;
+        };
+        let is_standard_path = mac.path.segments.len() == 1
+            || (mac.path.segments.len() == 2
+                && mac
+                    .path
+                    .segments
+                    .first()
+                    .is_some_and(|segment| segment.ident == "std" || segment.ident == "core"));
+        if !is_standard_path
+            || !matches!(
+                name.to_string().as_str(),
+                "assert"
+                    | "assert_eq"
+                    | "assert_ne"
+                    | "debug_assert"
+                    | "debug_assert_eq"
+                    | "debug_assert_ne"
+                    | "format"
+                    | "format_args"
+                    | "format_args_nl"
+                    | "panic"
+                    | "print"
+                    | "println"
+                    | "eprint"
+                    | "eprintln"
+                    | "write"
+                    | "writeln"
+            )
+        {
+            return;
+        }
+        // These standard macros accept comma-separated Rust expressions.
+        // Unknown macro grammars remain opaque even when their tokens look Rust-like.
+        let parser = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated;
+        let Ok(arguments) = parser.parse2(mac.tokens.clone()) else {
+            return;
+        };
+        for argument in &arguments {
+            syn::visit::Visit::visit_expr(self, argument);
         }
     }
 
@@ -1851,6 +1899,23 @@ pub fn probe() -> super::Thing {
             );
         assert_eq!(rebase_body_paths(src, Rebase::Nested), expected);
         assert_eq!(rebase_body_paths(src, Rebase::Keep), src);
+    }
+
+    #[test]
+    fn review_standard_expression_macro_arguments_rebase_paths() {
+        let src = r#"fn probe() {
+    assert_eq!(super::Thing::value(), self::value(), "{}", super::message());
+    let _ = format!("{}", super::Thing::value());
+    let _ = custom!(super::Thing, self::Thing);
+    let _ = custom::assert_eq!(super::Thing, self::Thing);
+    let _ = stringify!(super::Thing);
+}
+"#;
+        let expected = src
+            .replace("super::Thing::value()", "super::super::Thing::value()")
+            .replace("self::value()", "super::value()")
+            .replace("super::message()", "super::super::message()");
+        assert_eq!(rebase_body_paths(src, Rebase::Nested), expected);
     }
 
     #[test]

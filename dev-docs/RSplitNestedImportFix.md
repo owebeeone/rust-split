@@ -235,14 +235,24 @@ occurrence in either real file.
 
 ### Review fixes (2026-09-12)
 
-All four focused regressions failed before the fixes and now pass: opaque macro
-and attribute tokens survive body-path rebasing; renamed `self`/`super` imports
-rebase in headers and bodies; include literals accept one trailing comma; Windows
-drive-absolute and UNC paths stay unchanged on every host. Body-path rebasing now
-visits parsed Rust paths only; paths inside macro input may need manual repair.
-This supersedes the broad macro-argument rewriting described above.
+The four review regressions now pass: opaque macro and attribute tokens survive
+body-path rebasing; renamed `self`/`super` imports rebase in headers and bodies;
+include literals accept one trailing comma; Windows drive-absolute and UNC paths
+stay unchanged on every host. Body-path rebasing visits parsed Rust paths and
+parsed expression arguments to a small set of standard macros. Unknown macro
+grammars and attribute tokens remain opaque. This supersedes the broad recursive
+token rewriting described above without losing the common `assert!` / formatting
+cases used by the real fixture.
 
-`cargo fmt --all -- --check`, `cargo test` (41 library + 12 explode + 6 split
-tests), and `cargo clippy --all-targets --all-features -- -D warnings` pass.
-Production code shrank by 11 lines; regression tests added 97 lines. The earlier
-GWZ measurements were not rerun, and `/Users/owebeeone/limbo/gwz-dev` was untouched.
+The GWZ checks were rerun against scratch copies after review. The core file still
+splits into 20 files and `cargo check -p gwz-core --all-targets` reports zero
+errors. The CLI file splits into 18 files and reports only the two pre-existing
+`CommandFactory` trait-import errors described above. The source checkout at
+`/Users/owebeeone/limbo/gwz-dev` was untouched.
+
+The split core module's targeted behavior suite also remains green: 67 passed,
+0 failed. Final rust-split gates pass: `cargo fmt --all -- --check`, `cargo test`
+(42 library + 12 explode + 6 split tests), and
+`cargo clippy --all-targets --all-features -- -D warnings`. Relative to the
+pre-review branch, the production portion of `reassemble.rs` grows by 37 lines;
+the rest is focused regression coverage and these documentation updates.

@@ -268,7 +268,9 @@ API preservation.
 - `adjacency_hint` is syntactic. It records sibling identifier references, not a
   full semantic call graph, so shadowing and macro expansion can affect grouping.
 - Registration macros or framework-specific blocks may need manual treatment.
-  Relative module paths in macro input and attribute tokens are left verbatim.
+  Attribute tokens and unknown macro input are left verbatim. Paths in parsed
+  expression arguments to common standard assertion, formatting, and output
+  macros are re-based.
 - Large leaf items cannot be split internally; they are reported as still
   oversized.
 - A `#[path = "…"]` declaration in the parent changes where rustc looks for the
