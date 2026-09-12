@@ -141,6 +141,12 @@ fn reassemble(
         Topology::Bin => "crate",
         Topology::Mod => "super",
     };
+    // A part is a module *below* the file it came from, whichever topology, so
+    // the header imports it copies have to be re-anchored one level up.
+    let part_rebase = match topology {
+        Topology::Bin => Rebase::CrateRoot,
+        Topology::Mod => Rebase::Nested,
+    };
     let chunk_text = |i: usize| exploded.chunks[i].text.as_str();
     let row = |i: usize| {
         exploded
@@ -248,7 +254,7 @@ fn reassemble(
                 loc: 0,
             });
         }
-        let part_imports = select_imports(&import_chunks, &exploded.chunks, &refs);
+        let part_imports = select_imports(&import_chunks, &exploded.chunks, &refs, part_rebase);
         let contents = part_file(&part_imports, sibling, &body);
         mod_decls.push_str(&format!("mod {module};\n"));
         // One glob re-export per module, visibility chosen by the module's widest
@@ -334,7 +340,9 @@ fn reassemble(
     let root_imports = if root_refs.is_empty() {
         String::new()
     } else {
-        select_imports(&import_chunks, &exploded.chunks, &root_refs)
+        // The root file *is* the original module: its own imports still mean
+        // what they meant.
+        select_imports(&import_chunks, &exploded.chunks, &root_refs, Rebase::Keep)
     };
 
     let mut root = String::new();
@@ -594,17 +602,109 @@ impl Refs {
     }
 }
 
+/// How a copied `use` path must be re-anchored, given where the copy lands
+/// relative to the module the import was written in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rebase {
+    /// Same module — the paths already mean what they meant (the root file, and
+    /// any body extracted to the module level it already had).
+    Keep,
+    /// One module level below a nested module: `super::` needs one more
+    /// `super::`, and `self::` (the old module) becomes `super::`.
+    Nested,
+    /// One module level below a crate root: `self::` becomes `crate::`. A
+    /// crate root has no `super::`, so nothing else can move.
+    CrateRoot,
+}
+
+/// Re-anchor a copied `use` chunk for a file one module level below the one it
+/// was written in. Only the leading segment moves: `crate::`, `::`-rooted and
+/// external paths are untouched, and a re-export (`pub use …`) is never
+/// rewritten. Span-driven on the re-parsed chunk, so leading comments,
+/// attributes and formatting survive byte-exactly.
+fn rebase_import(chunk_text: &str, rebase: Rebase) -> String {
+    if matches!(rebase, Rebase::Keep) {
+        return chunk_text.to_owned();
+    }
+    let Ok(syn::Item::Use(item)) = syn::parse_str::<syn::Item>(chunk_text) else {
+        return chunk_text.to_owned();
+    };
+    // A re-export is the module's public surface and stays at the root verbatim;
+    // a `::`-rooted path is already absolute.
+    if !is_inherited(&item.vis) || item.leading_colon.is_some() {
+        return chunk_text.to_owned();
+    }
+    let mut edits = Vec::new();
+    collect_rebase_edits(&item.tree, rebase, &mut edits);
+    apply_replacements(chunk_text, &edits)
+}
+
+/// Collect the byte range and replacement text for each leading `super`/`self`
+/// segment of a `use` tree. A top-level group (`use {super::a, self::b};`)
+/// anchors each of its items separately, so it recurses; a group *after* a path
+/// segment does not (`use super::{self, a};` is anchored by the `super`).
+fn collect_rebase_edits(
+    tree: &syn::UseTree,
+    rebase: Rebase,
+    edits: &mut Vec<(std::ops::Range<usize>, &'static str)>,
+) {
+    match tree {
+        syn::UseTree::Path(path) => {
+            let range = path.ident.span().byte_range();
+            if path.ident == "super" && matches!(rebase, Rebase::Nested) {
+                edits.push((range, "super::super"));
+            } else if path.ident == "self" {
+                match rebase {
+                    Rebase::Nested => edits.push((range, "super")),
+                    Rebase::CrateRoot => edits.push((range, "crate")),
+                    Rebase::Keep => {}
+                }
+            }
+        }
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                collect_rebase_edits(item, rebase, edits);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Replace the given (non-overlapping, possibly empty) byte ranges in `text`.
+/// An empty range is an insertion point.
+fn apply_replacements(text: &str, edits: &[(std::ops::Range<usize>, &str)]) -> String {
+    let mut edits: Vec<(std::ops::Range<usize>, &str)> = edits.to_vec();
+    edits.sort_by_key(|(range, _)| range.start);
+    let mut out = String::with_capacity(text.len() + edits.len() * 8);
+    let mut prev = 0;
+    for (range, replacement) in &edits {
+        if range.start < prev {
+            continue;
+        }
+        out.push_str(&text[prev..range.start]);
+        out.push_str(replacement);
+        prev = range.end;
+    }
+    out.push_str(&text[prev..]);
+    out
+}
+
 /// Concatenate, in source order, the import chunks referenced by `refs` (plus
-/// name-less imports like `*` globs and `as _`, always kept). This is the
-/// aggressive policy: an import whose every name is unreferenced is dropped —
-/// including an extension trait used only via its methods, whose `use` the
-/// compiler will then ask to be re-added.
-fn select_imports(import_chunks: &[usize], chunks: &[crate::Chunk], refs: &Refs) -> String {
+/// name-less imports like `*` globs and `as _`, always kept), each re-anchored
+/// for where it lands. This is the aggressive policy: an import whose every name
+/// is unreferenced is dropped — including an extension trait used only via its
+/// methods, whose `use` the compiler will then ask to be re-added.
+fn select_imports(
+    import_chunks: &[usize],
+    chunks: &[crate::Chunk],
+    refs: &Refs,
+    rebase: Rebase,
+) -> String {
     let mut out = String::new();
     for &i in import_chunks {
         let text = chunks[i].text.as_str();
         if refs.keeps(&import_provided_names(text)) {
-            out.push_str(text);
+            out.push_str(&rebase_import(text, rebase));
         }
     }
     out
@@ -734,11 +834,14 @@ fn split_nested_mod(name: &str, inner: &str, max_loc: usize) -> (Vec<OutputFile>
         .max(1);
     let plan = plan_split(&exploded, item_budget);
     let is_super_glob = |t: &str| t.replace(' ', "").contains("usesuper::*;");
+    // `{name}/gNN.rs` is a module below `{name}`, so the body's own imports are
+    // re-anchored the same way a part's are.
     let group_header: String = plan
         .header
         .iter()
         .map(|&i| exploded.chunks[i].text.as_str())
         .filter(|t| !is_super_glob(t))
+        .map(|t| rebase_import(t, Rebase::Nested))
         .collect();
 
     let mut files = Vec::new();
@@ -1335,6 +1438,158 @@ mod tests {
             !root.contents.contains("HashMap"),
             "main never names HashMap (worker does) -> dropped from root:\n{}",
             root.contents
+        );
+    }
+
+    // ----- issue 4: a part sits one module level below the file it came from --
+
+    #[test]
+    fn nested_module_part_imports_gain_one_super_level() {
+        // A part of `foo.rs` is module `foo::<part>`, one level below `foo`, so a
+        // copied `use super::X` would name `foo` instead of `foo`'s parent and a
+        // copied `use self::X` would name the part itself.
+        let src = r#"use super::sibling::Thing;
+use super::{alpha, beta::Gamma};
+use self::local::X;
+use super::*;
+use crate::top::Absolute;
+use std::fmt::Display;
+
+pub fn one(t: Thing, g: Gamma, x: X, d: &dyn Display) -> i32 {
+    let _: Option<Absolute> = None;
+    let _ = (t, g, x, d);
+    alpha()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smoke() {
+        let _ = Thing;
+    }
+}
+"#;
+        let exploded = explode(src).unwrap();
+        let out = split_mod(&exploded, 10_000, "foo");
+
+        let part = out.files.iter().find(|f| f.path == "foo/one.rs").unwrap();
+        for expected in [
+            "use super::super::sibling::Thing;",
+            "use super::super::{alpha, beta::Gamma};",
+            "use super::local::X;",
+            "use super::super::*;",
+            // `crate::` and external paths are absolute — untouched.
+            "use crate::top::Absolute;",
+            "use std::fmt::Display;",
+        ] {
+            assert!(
+                part.contents.contains(expected),
+                "part must carry `{expected}`:\n{}",
+                part.contents
+            );
+        }
+        // The tool's own sibling glob is still there, exactly once, and is not
+        // confused with the header's rewritten `use super::*;`.
+        assert_eq!(
+            part.contents
+                .lines()
+                .filter(|l| l.trim() == "use super::*;")
+                .count(),
+            1,
+            "exactly one tool-added sibling glob:\n{}",
+            part.contents
+        );
+
+        // The root is still the original module — its header must not move.
+        let root = out.files.iter().find(|f| f.path == "foo.rs").unwrap();
+        assert!(
+            root.contents.contains("use super::sibling::Thing;"),
+            "root header stays byte-unchanged:\n{}",
+            root.contents
+        );
+        assert!(
+            !root.contents.contains("super::super"),
+            "the root did not move — nothing to re-anchor:\n{}",
+            root.contents
+        );
+    }
+
+    #[test]
+    fn crate_root_part_imports_rewrite_self_to_crate() {
+        // Below a crate root `self::X` names the part, not the crate root;
+        // `super::` cannot occur at a crate root, so nothing else changes.
+        let src = "use self::helpers::Helper;\nuse std::fmt::Display;\n\n\
+                   pub fn api(h: Helper, d: &dyn Display) {\n    let _ = (h, d);\n}\n";
+        let exploded = explode(src).unwrap();
+        let out = split_bin(&exploded, 10_000, "lib");
+
+        let part = out.files.iter().find(|f| f.path != "lib.rs").unwrap();
+        assert!(
+            part.contents.contains("use crate::helpers::Helper;"),
+            "`self::` re-anchors to `crate::` below a crate root:\n{}",
+            part.contents
+        );
+        assert!(part.contents.contains("use std::fmt::Display;"));
+    }
+
+    #[test]
+    fn nested_split_group_headers_gain_one_super_level() {
+        // `tests/gNN.rs` is module `tests::gNN`, one below the extracted `tests`
+        // body the group header was copied from.
+        let mut inner = String::from(
+            "    use super::outer::Thing;\n    use self::inner::Y;\n\n\
+             \x20   fn helper() -> i32 {\n        1\n    }\n",
+        );
+        for i in 0..30 {
+            inner.push_str(&format!(
+                "\n    #[test]\n    fn t{i}() {{\n        \
+                 let _: Option<Thing> = None;\n        let _: Option<Y> = None;\n        \
+                 assert_eq!(helper(), 1);\n    }}\n"
+            ));
+        }
+        let src = format!(
+            "pub fn helper() -> i32 {{\n    1\n}}\n\nfn main() {{}}\n\n\
+             #[cfg(test)]\nmod tests {{\n{inner}}}\n"
+        );
+        let exploded = explode(&src).unwrap();
+        let out = split_bin(&exploded, 60, "main");
+
+        let group = out.files.iter().find(|f| f.path == "tests/g00.rs").unwrap();
+        assert!(
+            group.contents.contains("use super::super::outer::Thing;"),
+            "group header `super::` gains a level:\n{}",
+            group.contents
+        );
+        assert!(
+            group.contents.contains("use super::inner::Y;"),
+            "group header `self::` becomes `super::`:\n{}",
+            group.contents
+        );
+    }
+
+    #[test]
+    fn extracted_inline_mod_keeps_its_own_super_paths() {
+        // An inline `mod tests` extracted out of `foo.rs` lands at `foo/tests.rs`
+        // — still module `foo::tests`, the level it already had — so its own
+        // `use super::helper;` still names `foo` and must NOT be re-anchored.
+        let src = "pub fn helper() -> i32 {\n    1\n}\n\n\
+                   #[cfg(test)]\nmod tests {\n    use super::helper;\n\n    #[test]\n    \
+                   fn smoke() {\n        assert_eq!(helper(), 1);\n    }\n}\n";
+        let exploded = explode(src).unwrap();
+        let out = split_mod(&exploded, 10_000, "foo");
+
+        let tests = out.files.iter().find(|f| f.path == "foo/tests.rs").unwrap();
+        assert!(
+            tests.contents.contains("use super::helper;"),
+            "an extracted mod keeps its own module level:\n{}",
+            tests.contents
+        );
+        assert!(
+            !tests.contents.contains("super::super"),
+            "the extracted body did not change module level:\n{}",
+            tests.contents
         );
     }
 }
