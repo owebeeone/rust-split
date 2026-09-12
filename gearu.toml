@@ -15,7 +15,7 @@ checks = [
     ["cargo", "fmt", "--all", "--", "--check"],
     ["cargo", "test", "--locked"],
     ["cargo", "clippy", "--all-targets", "--all-features", "--", "-D", "warnings"],
-    ["cargo", "package", "--list"],
+    ["cargo", "package", "--list", "--allow-dirty"],
     ["cargo", "publish", "--dry-run", "--locked", "--allow-dirty"],
 ]
 exact_checks = [
